@@ -4,10 +4,19 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
+use regex::Regex;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone)]
 pub struct RenderedDoc {
     pub lines: Vec<Line<'static>>,
+    pub images: Vec<RenderedImage>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RenderedImage {
+    pub src: String,
+    pub line_index: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +35,7 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
     let parser = Parser::new_ext(input, options);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut images: Vec<RenderedImage> = Vec::new();
     let mut current_spans: Vec<Span<'static>> = Vec::new();
 
     let mut style_stack = vec![Style::default()];
@@ -33,6 +43,7 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
     let mut in_code_block = false;
     let mut in_blockquote = 0usize;
     let mut pending_link: Option<String> = None;
+    let mut pending_image: Option<(String, String)> = None;
     let soft_break_as_space = true;
 
     fn push_line(lines: &mut Vec<Line<'static>>, spans: &mut Vec<Span<'static>>) {
@@ -59,7 +70,66 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
         "  ".repeat(list_stack.len().saturating_sub(1))
     }
 
+    fn append_image_entry(
+        lines: &mut Vec<Line<'static>>,
+        images: &mut Vec<RenderedImage>,
+        src: String,
+        alt_raw: String,
+        trailing_blank: bool,
+    ) {
+        let alt = alt_raw.trim().to_string();
+        let line_index = lines.len();
+        let mut spans = Vec::new();
+        spans.push(Span::styled(
+            "[image] ".to_string(),
+            Style::default().add_modifier(Modifier::DIM | Modifier::BOLD),
+        ));
+        if alt.is_empty() {
+            spans.push(Span::styled(
+                src.clone(),
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            ));
+        } else {
+            spans.push(Span::raw(alt));
+            spans.push(Span::styled(
+                format!(" ({src})"),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        lines.push(Line::from(spans));
+        images.push(RenderedImage { src, line_index });
+        if trailing_blank {
+            lines.push(Line::default());
+        }
+    }
+
     for event in parser {
+        if pending_image.is_some() {
+            match event {
+                Event::End(TagEnd::Image) => {
+                    let (src, alt_raw) = pending_image.take().expect("pending image exists");
+                    append_image_entry(&mut lines, &mut images, src, alt_raw, true);
+                }
+                Event::Text(text)
+                | Event::Code(text)
+                | Event::Html(text)
+                | Event::InlineHtml(text)
+                | Event::InlineMath(text)
+                | Event::DisplayMath(text) => {
+                    if let Some((_, alt)) = pending_image.as_mut() {
+                        alt.push_str(&text);
+                    }
+                }
+                Event::SoftBreak | Event::HardBreak => {
+                    if let Some((_, alt)) = pending_image.as_mut() {
+                        alt.push(' ');
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         match event {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => {}
@@ -152,14 +222,8 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
                     pending_link = Some(dest_url.to_string());
                 }
                 Tag::Image { dest_url, .. } => {
-                    let base = *style_stack.last().unwrap_or(&Style::default());
-                    style_stack.push(base.add_modifier(Modifier::BOLD));
-                    current_spans.push(Span::styled("[image: ".to_string(), base));
-                    current_spans.push(Span::styled(
-                        dest_url.to_string(),
-                        base.add_modifier(Modifier::UNDERLINED),
-                    ));
-                    current_spans.push(Span::styled("]".to_string(), base));
+                    blank_line(&mut lines, &mut current_spans);
+                    pending_image = Some((dest_url.to_string(), String::new()));
                 }
                 Tag::Table(_) => {
                     blank_line(&mut lines, &mut current_spans);
@@ -227,9 +291,7 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
                         ));
                     }
                 }
-                TagEnd::Image => {
-                    style_stack.pop();
-                }
+                TagEnd::Image => {}
                 TagEnd::Table => {
                     if !current_spans.is_empty() {
                         push_line(&mut lines, &mut current_spans);
@@ -274,10 +336,19 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
                 ));
             }
             Event::Html(text) => {
-                current_spans.push(Span::styled(
-                    text.to_string(),
-                    Style::default().add_modifier(Modifier::DIM),
-                ));
+                let html = text.to_string();
+                let html_images = extract_html_images(&html);
+                if html_images.is_empty() {
+                    current_spans.push(Span::styled(
+                        html,
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                } else {
+                    blank_line(&mut lines, &mut current_spans);
+                    for (src, alt) in html_images {
+                        append_image_entry(&mut lines, &mut images, src, alt, true);
+                    }
+                }
             }
             Event::SoftBreak => {
                 if soft_break_as_space {
@@ -316,10 +387,19 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
                 ));
             }
             Event::InlineHtml(text) => {
-                current_spans.push(Span::styled(
-                    text.to_string(),
-                    Style::default().add_modifier(Modifier::DIM),
-                ));
+                let html = text.to_string();
+                let html_images = extract_html_images(&html);
+                if html_images.is_empty() {
+                    current_spans.push(Span::styled(
+                        html,
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                } else {
+                    blank_line(&mut lines, &mut current_spans);
+                    for (src, alt) in html_images {
+                        append_image_entry(&mut lines, &mut images, src, alt, true);
+                    }
+                }
             }
         }
     }
@@ -327,6 +407,11 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
     if !current_spans.is_empty() {
         push_line(&mut lines, &mut current_spans);
     }
+
+    if let Some((src, alt_raw)) = pending_image.take() {
+        append_image_entry(&mut lines, &mut images, src, alt_raw, false);
+    }
+
     while lines.last().map(|l| l.spans.is_empty()).unwrap_or(false) {
         lines.pop();
     }
@@ -338,10 +423,86 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
         )));
     }
 
-    Ok(RenderedDoc { lines })
+    Ok(RenderedDoc { lines, images })
 }
 
 pub fn read_markdown_file(path: &std::path::Path) -> Result<String> {
     std::fs::read_to_string(path)
         .with_context(|| format!("failed to read file: {}", path.display()))
+}
+
+fn extract_html_images(html: &str) -> Vec<(String, String)> {
+    static IMG_TAG_RE: OnceLock<Regex> = OnceLock::new();
+    static SRC_RE: OnceLock<Regex> = OnceLock::new();
+    static ALT_RE: OnceLock<Regex> = OnceLock::new();
+
+    let img_tag_re = IMG_TAG_RE
+        .get_or_init(|| Regex::new(r#"(?is)<img\b[^>]*>"#).expect("valid image tag regex"));
+    let src_re = SRC_RE.get_or_init(|| {
+        Regex::new(r#"(?is)\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))"#)
+            .expect("valid src regex")
+    });
+    let alt_re = ALT_RE.get_or_init(|| {
+        Regex::new(r#"(?is)\balt\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))"#)
+            .expect("valid alt regex")
+    });
+
+    img_tag_re
+        .find_iter(html)
+        .filter_map(|m| {
+            let tag = m.as_str();
+            let src = src_re
+                .captures(tag)
+                .and_then(|caps| first_non_empty_capture_owned(&caps))?;
+            let alt = alt_re
+                .captures(tag)
+                .and_then(|caps| first_non_empty_capture_owned(&caps))
+                .unwrap_or_default();
+            Some((src, alt))
+        })
+        .collect()
+}
+
+fn first_non_empty_capture_owned(caps: &regex::Captures<'_>) -> Option<String> {
+    (1..caps.len())
+        .filter_map(|idx| caps.get(idx))
+        .map(|m| m.as_str())
+        .find(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn markdown_images_are_extracted_for_runtime_rendering() {
+        let doc = render_markdown("![Alt Text](images/sample.png)").expect("render succeeds");
+        assert_eq!(doc.images.len(), 1);
+        assert_eq!(doc.images[0].src, "images/sample.png");
+
+        let caption_line = &doc.lines[doc.images[0].line_index];
+        let caption_text = caption_line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(caption_text.contains("[image]"));
+    }
+
+    #[test]
+    fn html_img_tags_are_extracted_for_runtime_rendering() {
+        let input = r#"<img alt="Preview" src="https://example.com/preview.png" />"#;
+        let doc = render_markdown(input).expect("render succeeds");
+        assert_eq!(doc.images.len(), 1);
+        assert_eq!(doc.images[0].src, "https://example.com/preview.png");
+
+        let caption_line = &doc.lines[doc.images[0].line_index];
+        let caption_text = caption_line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(caption_text.contains("Preview"));
+    }
 }

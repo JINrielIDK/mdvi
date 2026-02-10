@@ -1,6 +1,7 @@
 use std::{
+    collections::BTreeMap,
     io::{self, Stdout},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -10,25 +11,36 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use image::ImageReader;
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
     Terminal,
 };
+use ratatui_image::{
+    picker::{Picker, ProtocolType},
+    protocol::StatefulProtocol,
+    Resize, StatefulImage,
+};
 use regex::{Regex, RegexBuilder};
 
-use crate::renderer::{read_markdown_file, render_markdown, RenderedDoc};
+use crate::{
+    renderer::{read_markdown_file, render_markdown, RenderedDoc},
+    ImageProtocol,
+};
 
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
-#[derive(Debug)]
 struct App {
     file_path: PathBuf,
     file_content: String,
     doc: RenderedDoc,
+    picker: Picker,
+    images: Vec<InlineImage>,
+    image_index_by_line: BTreeMap<usize, usize>,
     scroll: usize,
     status: String,
     show_help: bool,
@@ -39,6 +51,28 @@ struct App {
     active_match: usize,
 }
 
+struct InlineImage {
+    line_index: usize,
+    state: Option<StatefulProtocol>,
+    pixel_size: Option<(u32, u32)>,
+}
+
+struct ImageRenderPlan {
+    image_index: usize,
+    start_row: usize,
+    height: usize,
+}
+
+struct DisplayDoc {
+    lines: Vec<Line<'static>>,
+    image_plans: Vec<ImageRenderPlan>,
+}
+
+enum ResolvedImageSource {
+    Local(PathBuf),
+    Remote(String),
+}
+
 #[derive(Debug, Default)]
 enum Mode {
     #[default]
@@ -47,19 +81,39 @@ enum Mode {
 }
 
 impl App {
-    fn new(file_path: PathBuf, start_line: usize) -> Result<Self> {
+    fn new(file_path: PathBuf, start_line: usize, picker: Picker) -> Result<Self> {
         let file_content = read_markdown_file(&file_path)?;
         let doc = render_markdown(&file_content)?;
+        let images = load_images_for_doc(&file_path, &doc, &picker);
+        let image_index_by_line = images
+            .iter()
+            .enumerate()
+            .map(|(idx, image)| (image.line_index, idx))
+            .collect::<BTreeMap<usize, usize>>();
+        let loaded_images = images.iter().filter(|image| image.state.is_some()).count();
+        let image_failures = images.len().saturating_sub(loaded_images);
 
-        let scroll = start_line
-            .saturating_sub(1)
-            .min(doc.lines.len().saturating_sub(1));
-        let status = format!("{} lines", doc.lines.len());
+        let scroll = start_line.saturating_sub(1);
+        let status = if images.is_empty() {
+            format!("{} lines", doc.lines.len())
+        } else if image_failures == 0 {
+            format!("{} lines, {} images", doc.lines.len(), loaded_images)
+        } else {
+            format!(
+                "{} lines, {} images ({} failed)",
+                doc.lines.len(),
+                loaded_images,
+                image_failures
+            )
+        };
 
         Ok(Self {
             file_path,
             file_content,
             doc,
+            picker,
+            images,
+            image_index_by_line,
             scroll,
             status,
             show_help: false,
@@ -79,11 +133,35 @@ impl App {
             Ok((content, doc)) => {
                 self.file_content = content;
                 self.doc = doc;
-                self.scroll = self.scroll.min(self.doc.lines.len().saturating_sub(1));
+                self.images = load_images_for_doc(&self.file_path, &self.doc, &self.picker);
+                self.image_index_by_line = self
+                    .images
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, image)| (image.line_index, idx))
+                    .collect::<BTreeMap<usize, usize>>();
                 if self.search_regex.is_some() {
                     self.rebuild_search_matches();
                 }
-                self.status = format!("reloaded {}", self.file_path.display());
+                let loaded_images = self
+                    .images
+                    .iter()
+                    .filter(|image| image.state.is_some())
+                    .count();
+                let image_failures = self.images.len().saturating_sub(loaded_images);
+                self.status = if self.images.is_empty() {
+                    format!("reloaded {}", self.file_path.display())
+                } else if image_failures == 0 {
+                    format!(
+                        "reloaded {} ({loaded_images} images)",
+                        self.file_path.display()
+                    )
+                } else {
+                    format!(
+                        "reloaded {} ({loaded_images} images, {image_failures} failed)",
+                        self.file_path.display()
+                    )
+                };
             }
             Err(err) => {
                 self.status = format!("reload failed: {err}");
@@ -91,15 +169,17 @@ impl App {
         }
     }
 
-    fn max_scroll(&self, viewport_height: usize) -> usize {
-        self.doc
-            .lines
-            .len()
+    fn total_virtual_lines(&self, content_width: u16) -> usize {
+        self.build_display_doc(content_width).lines.len().max(1)
+    }
+
+    fn max_scroll(&self, viewport_height: usize, content_width: u16) -> usize {
+        self.total_virtual_lines(content_width)
             .saturating_sub(viewport_height.saturating_sub(1))
     }
 
-    fn scroll_down(&mut self, n: usize, viewport_height: usize) {
-        let max = self.max_scroll(viewport_height);
+    fn scroll_down(&mut self, n: usize, viewport_height: usize, content_width: u16) {
+        let max = self.max_scroll(viewport_height, content_width);
         self.scroll = self.scroll.saturating_add(n).min(max);
     }
 
@@ -111,8 +191,8 @@ impl App {
         self.scroll = 0;
     }
 
-    fn jump_bottom(&mut self, viewport_height: usize) {
-        self.scroll = self.max_scroll(viewport_height);
+    fn jump_bottom(&mut self, viewport_height: usize, content_width: u16) {
+        self.scroll = self.max_scroll(viewport_height, content_width);
     }
 
     fn line_text_at(&self, index: usize) -> String {
@@ -128,7 +208,7 @@ impl App {
             .unwrap_or_default()
     }
 
-    fn search(&mut self, query: &str, viewport_height: usize) {
+    fn search(&mut self, query: &str, viewport_height: usize, content_width: u16) {
         if query.is_empty() {
             self.search_query = None;
             self.search_regex = None;
@@ -158,20 +238,24 @@ impl App {
             return;
         }
 
-        self.scroll = self.search_matches[0].min(self.max_scroll(viewport_height));
+        self.scroll = self
+            .virtual_row_for_doc_line(self.search_matches[0], content_width)
+            .min(self.max_scroll(viewport_height, content_width));
         self.status = format!("{} matches for /{query}", self.search_matches.len());
     }
 
-    fn jump_next_match(&mut self, viewport_height: usize) {
+    fn jump_next_match(&mut self, viewport_height: usize, content_width: u16) {
         if self.search_matches.is_empty() {
             self.status = "no active search results".to_string();
             return;
         }
         self.active_match = (self.active_match + 1) % self.search_matches.len();
-        self.scroll = self.search_matches[self.active_match].min(self.max_scroll(viewport_height));
+        self.scroll = self
+            .virtual_row_for_doc_line(self.search_matches[self.active_match], content_width)
+            .min(self.max_scroll(viewport_height, content_width));
     }
 
-    fn jump_prev_match(&mut self, viewport_height: usize) {
+    fn jump_prev_match(&mut self, viewport_height: usize, content_width: u16) {
         if self.search_matches.is_empty() {
             self.status = "no active search results".to_string();
             return;
@@ -181,7 +265,9 @@ impl App {
         } else {
             self.active_match -= 1;
         }
-        self.scroll = self.search_matches[self.active_match].min(self.max_scroll(viewport_height));
+        self.scroll = self
+            .virtual_row_for_doc_line(self.search_matches[self.active_match], content_width)
+            .min(self.max_scroll(viewport_height, content_width));
     }
 
     fn active_match_line(&self) -> Option<usize> {
@@ -209,6 +295,69 @@ impl App {
                 self.search_matches.push(idx);
             }
         }
+    }
+
+    fn virtual_row_for_doc_line(&self, line_index: usize, content_width: u16) -> usize {
+        let mut row = line_index;
+        for image in &self.images {
+            if image.line_index < line_index {
+                row += self.image_height_for(image, content_width);
+            }
+        }
+        row
+    }
+
+    fn image_height_for(&self, image: &InlineImage, content_width: u16) -> usize {
+        const MAX_IMAGE_CELL_HEIGHT: usize = 18;
+
+        if image.state.is_none() {
+            return 0;
+        }
+        let Some((pixel_width, pixel_height)) = image.pixel_size else {
+            return 0;
+        };
+        if pixel_width == 0 || pixel_height == 0 || content_width == 0 {
+            return 0;
+        }
+
+        let (font_width_cells, font_height_cells) = self.picker.font_size();
+        let font_width = u32::from(font_width_cells.max(1));
+        let font_height = u32::from(font_height_cells.max(1));
+
+        let max_pixel_width = u32::from(content_width) * font_width;
+        let target_pixel_width = pixel_width.min(max_pixel_width).max(1);
+        let target_pixel_height = (u64::from(pixel_height) * u64::from(target_pixel_width))
+            .div_ceil(u64::from(pixel_width)) as u32;
+        let height_cells = target_pixel_height.div_ceil(font_height).max(1) as usize;
+
+        height_cells.min(MAX_IMAGE_CELL_HEIGHT)
+    }
+
+    fn build_display_doc(&self, content_width: u16) -> DisplayDoc {
+        let source_lines = self.highlighted_lines();
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(source_lines.len());
+        let mut image_plans = Vec::new();
+
+        for (line_index, line) in source_lines.into_iter().enumerate() {
+            lines.push(line);
+
+            if let Some(image_index) = self.image_index_by_line.get(&line_index).copied() {
+                let height = self.image_height_for(&self.images[image_index], content_width);
+                if height > 0 {
+                    let start_row = lines.len();
+                    for _ in 0..height {
+                        lines.push(Line::default());
+                    }
+                    image_plans.push(ImageRenderPlan {
+                        image_index,
+                        start_row,
+                        height,
+                    });
+                }
+            }
+        }
+
+        DisplayDoc { lines, image_plans }
     }
 }
 
@@ -241,93 +390,160 @@ impl Drop for TuiGuard {
     }
 }
 
-pub fn run(file_path: PathBuf, start_line: usize) -> Result<()> {
-    let mut app = App::new(file_path, start_line)?;
+pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol) -> Result<()> {
     let mut tui = TuiGuard::setup()?;
+    let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((10, 20)));
+    if let Some(protocol_type) = protocol_override(image_protocol) {
+        picker.set_protocol_type(protocol_type);
+    }
+    let mut app = App::new(file_path, start_line, picker)?;
+    let mut should_redraw = true;
 
     loop {
-        let terminal = tui.terminal_mut();
-        terminal.draw(|frame| {
-            let size = frame.area();
+        if should_redraw {
+            let terminal = tui.terminal_mut();
+            terminal.draw(|frame| {
+                let size = frame.area();
 
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(1)])
-                .split(size);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(1)])
+                    .split(size);
 
-            let viewport_height = chunks[0].height as usize;
-            app.scroll = app.scroll.min(app.max_scroll(viewport_height));
+                let title = format!(" mdvi {} ", app.file_path.display());
+                let content_block = Block::default().borders(Borders::ALL).title(title);
+                let content_inner = content_block.inner(chunks[0]);
+                let content_width = content_inner.width;
+                let viewport_height = usize::from(content_inner.height);
+                let display_doc = app.build_display_doc(content_width);
+                let total_rows = display_doc.lines.len().max(1);
+                app.scroll = app
+                    .scroll
+                    .min(app.max_scroll(viewport_height, content_width));
 
-            let title = format!(" mdvi {} ", app.file_path.display());
-            let content_block = Block::default().borders(Borders::ALL).title(title);
+                let text = Text::from(display_doc.lines.clone());
+                let paragraph = Paragraph::new(text)
+                    .block(content_block)
+                    .wrap(Wrap { trim: false })
+                    .scroll((app.scroll as u16, 0));
 
-            let text = Text::from(app.highlighted_lines());
-            let paragraph = Paragraph::new(text)
-                .block(content_block)
-                .wrap(Wrap { trim: false })
-                .scroll((app.scroll as u16, 0));
+                frame.render_widget(paragraph, chunks[0]);
 
-            frame.render_widget(paragraph, chunks[0]);
-
-            let status = if app.show_help {
-                "q quit | j/k move | g/G top/bottom | Ctrl-d/u half-page | Ctrl-f/b page | / search | n/N next/prev | r reload | ? help"
-                    .to_string()
-            } else {
-                match &app.mode {
-                    Mode::Normal => {
-                        let mut right = format!(
-                            "{}  |  line {} / {}  |  ? help",
-                            app.status,
-                            app.scroll + 1,
-                            app.doc.lines.len()
-                        );
-                        if !app.search_matches.is_empty() {
-                            right.push_str(&format!(
-                                "  |  match {} / {}",
-                                app.active_match + 1,
-                                app.search_matches.len()
-                            ));
-                        }
-                        right
+                for plan in &display_doc.image_plans {
+                    if plan.start_row < app.scroll
+                        || plan.start_row.saturating_add(plan.height)
+                            > app.scroll.saturating_add(viewport_height)
+                    {
+                        continue;
                     }
-                    Mode::SearchInput(query) => format!("/{query}"),
+                    let image_y = content_inner
+                        .y
+                        .saturating_add((plan.start_row - app.scroll) as u16);
+                    let image_area = Rect::new(
+                        content_inner.x,
+                        image_y,
+                        content_inner.width,
+                        plan.height as u16,
+                    );
+                    if image_area.width == 0 || image_area.height == 0 {
+                        continue;
+                    }
+                    if let Some(image_state) = app.images[plan.image_index].state.as_mut() {
+                        frame.render_stateful_widget(
+                            StatefulImage::default().resize(Resize::Fit(None)),
+                            image_area,
+                            image_state,
+                        );
+                    }
                 }
-            };
 
-            let status_line = Line::from(vec![Span::styled(
-                status,
-                Style::default().add_modifier(Modifier::DIM),
-            )]);
-            frame.render_widget(Paragraph::new(status_line), chunks[1]);
-        })?;
+                let status = if app.show_help {
+                    "q quit | j/k move | g/G top/bottom | Ctrl-d/u half-page | Ctrl-f/b page | / search | n/N next/prev | r reload | ? help"
+                        .to_string()
+                } else {
+                    match &app.mode {
+                        Mode::Normal => {
+                            let mut right = format!(
+                                "{}  |  row {} / {}  |  ? help",
+                                app.status,
+                                app.scroll.saturating_add(1).min(total_rows),
+                                total_rows
+                            );
+                            if !app.search_matches.is_empty() {
+                                right.push_str(&format!(
+                                    "  |  match {} / {}",
+                                    app.active_match + 1,
+                                    app.search_matches.len()
+                                ));
+                            }
+                            right
+                        }
+                        Mode::SearchInput(query) => format!("/{query}"),
+                    }
+                };
 
-        if !event::poll(Duration::from_millis(200))? {
+                let status_line = Line::from(vec![Span::styled(
+                    status,
+                    Style::default().add_modifier(Modifier::DIM),
+                )]);
+                frame.render_widget(Paragraph::new(status_line), chunks[1]);
+            })?;
+            should_redraw = false;
+        }
+
+        if !event::poll(Duration::from_millis(250))? {
             continue;
         }
 
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
+        match event::read()? {
+            Event::Resize(..) => {
+                should_redraw = true;
             }
+            Event::Key(key) => {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
 
-            let size = tui.terminal_mut().size()?;
-            let viewport_height = size.height.saturating_sub(2) as usize;
-            let half_page = (viewport_height / 2).max(1);
-            let full_page = viewport_height.max(1);
+                let size = tui.terminal_mut().size()?;
+                let viewport_height = size.height.saturating_sub(3) as usize;
+                let content_width = size.width.saturating_sub(2);
+                let half_page = (viewport_height / 2).max(1);
+                let full_page = viewport_height.max(1);
 
-            if handle_key_event(&mut app, key, viewport_height, half_page, full_page) {
-                break;
+                if handle_key_event(
+                    &mut app,
+                    key,
+                    viewport_height,
+                    content_width,
+                    half_page,
+                    full_page,
+                ) {
+                    break;
+                }
+                should_redraw = true;
             }
+            _ => {}
         }
     }
 
     Ok(())
 }
 
+fn protocol_override(image_protocol: ImageProtocol) -> Option<ProtocolType> {
+    match image_protocol {
+        ImageProtocol::Auto => None,
+        ImageProtocol::Halfblocks => Some(ProtocolType::Halfblocks),
+        ImageProtocol::Sixel => Some(ProtocolType::Sixel),
+        ImageProtocol::Kitty => Some(ProtocolType::Kitty),
+        ImageProtocol::Iterm2 => Some(ProtocolType::Iterm2),
+    }
+}
+
 fn handle_key_event(
     app: &mut App,
     key: KeyEvent,
     viewport_height: usize,
+    content_width: u16,
     half_page: usize,
     full_page: usize,
 ) -> bool {
@@ -338,7 +554,7 @@ fn handle_key_event(
             }
             KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r') => {
                 let q = query.clone();
-                app.search(&q, viewport_height);
+                app.search(&q, viewport_height, content_width);
                 app.mode = Mode::Normal;
             }
             KeyCode::Backspace => {
@@ -367,15 +583,15 @@ fn handle_key_event(
             false
         }
         (KeyCode::Char('n'), _) => {
-            app.jump_next_match(viewport_height);
+            app.jump_next_match(viewport_height, content_width);
             false
         }
         (KeyCode::Char('N'), _) => {
-            app.jump_prev_match(viewport_height);
+            app.jump_prev_match(viewport_height, content_width);
             false
         }
         (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
-            app.scroll_down(1, viewport_height);
+            app.scroll_down(1, viewport_height, content_width);
             false
         }
         (KeyCode::Char('k'), _) | (KeyCode::Up, _) => {
@@ -383,7 +599,7 @@ fn handle_key_event(
             false
         }
         (KeyCode::PageDown, _) => {
-            app.scroll_down(full_page, viewport_height);
+            app.scroll_down(full_page, viewport_height, content_width);
             false
         }
         (KeyCode::PageUp, _) => {
@@ -391,7 +607,7 @@ fn handle_key_event(
             false
         }
         (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
-            app.scroll_down(full_page, viewport_height);
+            app.scroll_down(full_page, viewport_height, content_width);
             false
         }
         (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
@@ -399,7 +615,7 @@ fn handle_key_event(
             false
         }
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-            app.scroll_down(half_page, viewport_height);
+            app.scroll_down(half_page, viewport_height, content_width);
             false
         }
         (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
@@ -411,10 +627,96 @@ fn handle_key_event(
             false
         }
         (KeyCode::Char('G'), _) | (KeyCode::End, _) => {
-            app.jump_bottom(viewport_height);
+            app.jump_bottom(viewport_height, content_width);
             false
         }
         _ => false,
+    }
+}
+
+fn load_images_for_doc(
+    markdown_path: &Path,
+    doc: &RenderedDoc,
+    picker: &Picker,
+) -> Vec<InlineImage> {
+    let remote_client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .user_agent(format!("mdvi/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .ok();
+
+    doc.images
+        .iter()
+        .map(|image| {
+            let mut inline = InlineImage {
+                line_index: image.line_index,
+                state: None,
+                pixel_size: None,
+            };
+
+            let Some(source) = resolve_image_source(markdown_path, &image.src) else {
+                return inline;
+            };
+
+            match source {
+                ResolvedImageSource::Local(path) => {
+                    if let Ok(reader) = ImageReader::open(&path) {
+                        if let Ok(dynamic_image) = reader.decode() {
+                            inline.pixel_size =
+                                Some((dynamic_image.width(), dynamic_image.height()));
+                            inline.state = Some(picker.new_resize_protocol(dynamic_image));
+                        }
+                    }
+                }
+                ResolvedImageSource::Remote(url) => {
+                    if let Some(client) = &remote_client {
+                        if let Ok(response) = client
+                            .get(url)
+                            .send()
+                            .and_then(|resp| resp.error_for_status())
+                        {
+                            if let Ok(bytes) = response.bytes() {
+                                if let Ok(dynamic_image) = image::load_from_memory(&bytes) {
+                                    inline.pixel_size =
+                                        Some((dynamic_image.width(), dynamic_image.height()));
+                                    inline.state = Some(picker.new_resize_protocol(dynamic_image));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            inline
+        })
+        .collect()
+}
+
+fn resolve_image_source(markdown_path: &Path, src: &str) -> Option<ResolvedImageSource> {
+    let src = src.trim();
+    if src.is_empty() {
+        return None;
+    }
+    if src.starts_with("http://") || src.starts_with("https://") {
+        return Some(ResolvedImageSource::Remote(src.to_string()));
+    }
+    if let Some(path) = src.strip_prefix("file://") {
+        return Some(ResolvedImageSource::Local(PathBuf::from(path)));
+    }
+    if src.contains("://") {
+        return None;
+    }
+
+    let path = PathBuf::from(src);
+    if path.is_absolute() {
+        Some(ResolvedImageSource::Local(path))
+    } else {
+        Some(ResolvedImageSource::Local(
+            markdown_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(path),
+        ))
     }
 }
 
@@ -431,7 +733,13 @@ mod tests {
         App {
             file_path: PathBuf::from("test.md"),
             file_content: String::new(),
-            doc: RenderedDoc { lines: doc_lines },
+            doc: RenderedDoc {
+                lines: doc_lines,
+                images: Vec::new(),
+            },
+            picker: Picker::from_fontsize((8, 16)),
+            images: Vec::new(),
+            image_index_by_line: BTreeMap::new(),
             scroll: 0,
             status: String::new(),
             show_help: false,
@@ -446,8 +754,8 @@ mod tests {
     #[test]
     fn scroll_clamps_to_bottom() {
         let mut app = test_app(100);
-        app.scroll_down(1000, 20);
-        assert_eq!(app.scroll, app.max_scroll(20));
+        app.scroll_down(1000, 20, 80);
+        assert_eq!(app.scroll, app.max_scroll(20, 80));
     }
 
     #[test]
@@ -464,7 +772,7 @@ mod tests {
         app.doc.lines[5] = Line::from("alpha keyword");
         app.doc.lines[12] = Line::from("beta keyword");
 
-        app.search("keyword", 10);
+        app.search("keyword", 10, 80);
         assert_eq!(app.search_matches, vec![5, 12]);
         assert_eq!(app.scroll, 5);
     }
@@ -475,7 +783,7 @@ mod tests {
         app.search_matches = vec![3, 8];
         app.active_match = 1;
 
-        app.jump_next_match(10);
+        app.jump_next_match(10, 80);
         assert_eq!(app.active_match, 0);
         assert_eq!(app.scroll, 3);
     }
@@ -491,6 +799,7 @@ mod tests {
             &mut app,
             KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
             viewport_height,
+            80,
             half_page,
             full_page,
         );
@@ -500,6 +809,7 @@ mod tests {
             &mut app,
             KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
             viewport_height,
+            80,
             half_page,
             full_page,
         );
@@ -529,6 +839,54 @@ mod tests {
             .expect("highlighted span exists");
 
         assert!(mdvi_span.style.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn resolve_image_source_supports_https_urls() {
+        let source = resolve_image_source(
+            Path::new("/tmp/doc.md"),
+            "https://example.com/assets/preview.png",
+        )
+        .expect("should resolve");
+        match source {
+            ResolvedImageSource::Remote(url) => {
+                assert_eq!(url, "https://example.com/assets/preview.png")
+            }
+            ResolvedImageSource::Local(_) => panic!("expected remote source"),
+        }
+    }
+
+    #[test]
+    fn resolve_image_source_resolves_relative_local_paths() {
+        let source =
+            resolve_image_source(Path::new("/tmp/docs/readme.md"), "images/diagram.png").unwrap();
+        match source {
+            ResolvedImageSource::Local(path) => {
+                assert_eq!(path, PathBuf::from("/tmp/docs/images/diagram.png"));
+            }
+            ResolvedImageSource::Remote(_) => panic!("expected local source"),
+        }
+    }
+
+    #[test]
+    fn image_protocol_override_mapping() {
+        assert_eq!(protocol_override(ImageProtocol::Auto), None);
+        assert_eq!(
+            protocol_override(ImageProtocol::Halfblocks),
+            Some(ProtocolType::Halfblocks)
+        );
+        assert_eq!(
+            protocol_override(ImageProtocol::Sixel),
+            Some(ProtocolType::Sixel)
+        );
+        assert_eq!(
+            protocol_override(ImageProtocol::Kitty),
+            Some(ProtocolType::Kitty)
+        );
+        assert_eq!(
+            protocol_override(ImageProtocol::Iterm2),
+            Some(ProtocolType::Iterm2)
+        );
     }
 }
 

@@ -14,11 +14,18 @@ It renders markdown into a polished full-screen TUI with fast keyboard navigatio
   - headings
   - lists and task lists
   - blockquotes
+  - inline markdown images (`![alt](...)`) and HTML `<img ...>` tags
   - code blocks and inline code
   - links, tables, footnotes, emphasis/strong/strikethrough
+- Configurable image backend via `--image-protocol` (`auto`, `halfblocks`, `sixel`, `kitty`, `iterm2`)
 - Live reload (`r`) when the file changes on disk
 - Start at specific line (`--line`)
 - Works with standard terminal keys (arrows, page up/down, home/end)
+
+Notes:
+- Local, `file://`, and remote `http://` / `https://` image sources are supported.
+- On macOS, terminal-native image protocols can trigger an "Allow Terminal-Initiated Display?" prompt.
+  Use `--image-protocol halfblocks` if you want image rendering without that dialog.
 
 ## Install
 
@@ -52,6 +59,7 @@ Examples:
 ```bash
 mdvi docs/spec.md
 mdvi --line 120 CHANGELOG.md
+mdvi --image-protocol halfblocks README.md
 ```
 
 ## Navigation
