@@ -3,6 +3,7 @@
 `mdvi` is a terminal markdown viewer with Vim-style navigation.
 
 It renders markdown into a polished full-screen TUI with fast keyboard navigation, clear typography, and predictable behavior for large files.
+<img width="1708" height="1040" alt="preview-mdvi" src="https://github.com/user-attachments/assets/e190b4b2-2711-446e-85da-6529fc0a0153" />
 
 ## Features
 
