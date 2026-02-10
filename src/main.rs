@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::Parser;
 
 #[derive(Debug, Parser)]
-#[command(name = "mdview")]
+#[command(name = "mdvi")]
 #[command(
     version,
     about = "A high-quality markdown file viewer for the terminal"

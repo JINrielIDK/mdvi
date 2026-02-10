@@ -18,6 +18,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Terminal,
 };
+use regex::{Regex, RegexBuilder};
 
 use crate::renderer::{read_markdown_file, render_markdown, RenderedDoc};
 
@@ -32,6 +33,8 @@ struct App {
     status: String,
     show_help: bool,
     mode: Mode,
+    search_query: Option<String>,
+    search_regex: Option<Regex>,
     search_matches: Vec<usize>,
     active_match: usize,
 }
@@ -61,6 +64,8 @@ impl App {
             status,
             show_help: false,
             mode: Mode::Normal,
+            search_query: None,
+            search_regex: None,
             search_matches: Vec::new(),
             active_match: 0,
         })
@@ -75,6 +80,9 @@ impl App {
                 self.file_content = content;
                 self.doc = doc;
                 self.scroll = self.scroll.min(self.doc.lines.len().saturating_sub(1));
+                if self.search_regex.is_some() {
+                    self.rebuild_search_matches();
+                }
                 self.status = format!("reloaded {}", self.file_path.display());
             }
             Err(err) => {
@@ -121,21 +129,29 @@ impl App {
     }
 
     fn search(&mut self, query: &str, viewport_height: usize) {
-        self.search_matches.clear();
-        self.active_match = 0;
-
         if query.is_empty() {
+            self.search_query = None;
+            self.search_regex = None;
+            self.search_matches.clear();
+            self.active_match = 0;
             self.status = "search cleared".to_string();
             return;
         }
 
-        let query_lc = query.to_lowercase();
-        for (idx, _) in self.doc.lines.iter().enumerate() {
-            let line = self.line_text_at(idx);
-            if line.to_lowercase().contains(&query_lc) {
-                self.search_matches.push(idx);
+        let regex = match RegexBuilder::new(&regex::escape(query))
+            .case_insensitive(true)
+            .build()
+        {
+            Ok(regex) => regex,
+            Err(err) => {
+                self.status = format!("invalid search: {err}");
+                return;
             }
-        }
+        };
+
+        self.search_query = Some(query.to_string());
+        self.search_regex = Some(regex);
+        self.rebuild_search_matches();
 
         if self.search_matches.is_empty() {
             self.status = format!("no matches for /{query}");
@@ -166,6 +182,33 @@ impl App {
             self.active_match -= 1;
         }
         self.scroll = self.search_matches[self.active_match].min(self.max_scroll(viewport_height));
+    }
+
+    fn active_match_line(&self) -> Option<usize> {
+        self.search_matches.get(self.active_match).copied()
+    }
+
+    fn highlighted_lines(&self) -> Vec<Line<'static>> {
+        let Some(regex) = self.search_regex.as_ref() else {
+            return self.doc.lines.clone();
+        };
+
+        highlight_lines(&self.doc.lines, regex, self.active_match_line())
+    }
+
+    fn rebuild_search_matches(&mut self) {
+        self.search_matches.clear();
+        self.active_match = 0;
+
+        let Some(regex) = self.search_regex.as_ref() else {
+            return;
+        };
+
+        for (idx, _) in self.doc.lines.iter().enumerate() {
+            if regex.is_match(&self.line_text_at(idx)) {
+                self.search_matches.push(idx);
+            }
+        }
     }
 }
 
@@ -215,10 +258,10 @@ pub fn run(file_path: PathBuf, start_line: usize) -> Result<()> {
             let viewport_height = chunks[0].height as usize;
             app.scroll = app.scroll.min(app.max_scroll(viewport_height));
 
-            let title = format!(" mdview {} ", app.file_path.display());
+            let title = format!(" mdvi {} ", app.file_path.display());
             let content_block = Block::default().borders(Borders::ALL).title(title);
 
-            let text = Text::from(app.doc.lines.clone());
+            let text = Text::from(app.highlighted_lines());
             let paragraph = Paragraph::new(text)
                 .block(content_block)
                 .wrap(Wrap { trim: false })
@@ -227,7 +270,7 @@ pub fn run(file_path: PathBuf, start_line: usize) -> Result<()> {
             frame.render_widget(paragraph, chunks[0]);
 
             let status = if app.show_help {
-                "q quit | j/k move | g/G top/bottom | Ctrl-d/u half-page | / search | n/N next/prev | r reload | ? help"
+                "q quit | j/k move | g/G top/bottom | Ctrl-d/u half-page | Ctrl-f/b page | / search | n/N next/prev | r reload | ? help"
                     .to_string()
             } else {
                 match &app.mode {
@@ -347,6 +390,14 @@ fn handle_key_event(
             app.scroll_up(full_page);
             false
         }
+        (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+            app.scroll_down(full_page, viewport_height);
+            false
+        }
+        (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+            app.scroll_up(full_page);
+            false
+        }
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
             app.scroll_down(half_page, viewport_height);
             false
@@ -385,6 +436,8 @@ mod tests {
             status: String::new(),
             show_help: false,
             mode: Mode::Normal,
+            search_query: None,
+            search_regex: None,
             search_matches: Vec::new(),
             active_match: 0,
         }
@@ -426,4 +479,152 @@ mod tests {
         assert_eq!(app.active_match, 0);
         assert_eq!(app.scroll, 3);
     }
+
+    #[test]
+    fn ctrl_f_and_ctrl_b_scroll_full_page() {
+        let mut app = test_app(200);
+        let viewport_height = 20;
+        let full_page = 20;
+        let half_page = 10;
+
+        let _ = handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            viewport_height,
+            half_page,
+            full_page,
+        );
+        assert_eq!(app.scroll, 20);
+
+        let _ = handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            viewport_height,
+            half_page,
+            full_page,
+        );
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn search_highlight_applies_reverse_modifier() {
+        let regex = RegexBuilder::new(&regex::escape("mdvi"))
+            .case_insensitive(true)
+            .build()
+            .expect("regex should compile");
+        let line = Line::from(vec![
+            Span::styled("hello ".to_string(), Style::default()),
+            Span::styled(
+                "mdvi".to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" world".to_string(), Style::default()),
+        ]);
+
+        let highlighted = highlight_lines(&[line], &regex, Some(0));
+        let spans = &highlighted[0].spans;
+        let mdvi_span = spans
+            .iter()
+            .find(|span| span.content.as_ref() == "mdvi")
+            .expect("highlighted span exists");
+
+        assert!(mdvi_span.style.add_modifier.contains(Modifier::REVERSED));
+    }
+}
+
+fn highlight_lines(
+    lines: &[Line<'static>],
+    regex: &Regex,
+    active_match_line: Option<usize>,
+) -> Vec<Line<'static>> {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(idx, line)| {
+            let line_text = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            let ranges = regex
+                .find_iter(&line_text)
+                .map(|m| (m.start(), m.end()))
+                .collect::<Vec<_>>();
+            if ranges.is_empty() {
+                return line.clone();
+            }
+
+            let highlight_style = if Some(idx) == active_match_line {
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                Style::default().add_modifier(Modifier::REVERSED)
+            };
+
+            apply_highlight_ranges(line, &ranges, highlight_style)
+        })
+        .collect()
+}
+
+fn apply_highlight_ranges(
+    line: &Line<'static>,
+    ranges: &[(usize, usize)],
+    highlight_style: Style,
+) -> Line<'static> {
+    let mut out_spans: Vec<Span<'static>> = Vec::new();
+    let mut range_idx = 0usize;
+    let mut global_offset = 0usize;
+
+    for span in &line.spans {
+        let text = span.content.as_ref();
+        let span_start = global_offset;
+        let span_end = global_offset + text.len();
+        let mut local_cursor = 0usize;
+
+        while range_idx < ranges.len() {
+            let (match_start, match_end) = ranges[range_idx];
+
+            if match_end <= span_start {
+                range_idx += 1;
+                continue;
+            }
+
+            if match_start >= span_end {
+                break;
+            }
+
+            let overlap_start = match_start.max(span_start);
+            let overlap_end = match_end.min(span_end);
+            let overlap_local_start = overlap_start - span_start;
+            let overlap_local_end = overlap_end - span_start;
+
+            if overlap_local_start > local_cursor {
+                out_spans.push(Span::styled(
+                    text[local_cursor..overlap_local_start].to_string(),
+                    span.style,
+                ));
+            }
+
+            if overlap_local_end > overlap_local_start {
+                out_spans.push(Span::styled(
+                    text[overlap_local_start..overlap_local_end].to_string(),
+                    span.style.patch(highlight_style),
+                ));
+                local_cursor = overlap_local_end;
+            }
+
+            if match_end <= span_end {
+                range_idx += 1;
+            } else {
+                break;
+            }
+        }
+
+        if local_cursor < text.len() {
+            out_spans.push(Span::styled(text[local_cursor..].to_string(), span.style));
+        }
+
+        global_offset = span_end;
+    }
+
+    Line::from(out_spans)
 }

@@ -1,6 +1,6 @@
-# mdview
+# mdvi
 
-`mdview` is a professional terminal markdown viewer with Vim-style navigation.
+`mdvi` is a terminal markdown viewer with Vim-style navigation.
 
 It renders markdown into a polished full-screen TUI with fast keyboard navigation, clear typography, and predictable behavior for large files.
 
@@ -36,14 +36,14 @@ cargo run -- README.md
 ## Usage
 
 ```bash
-mdview [OPTIONS] <PATH>
+mdvi [OPTIONS] <PATH>
 ```
 
 Examples:
 
 ```bash
-mdview docs/spec.md
-mdview --line 120 CHANGELOG.md
+mdvi docs/spec.md
+mdvi --line 120 CHANGELOG.md
 ```
 
 ## Navigation
@@ -54,6 +54,8 @@ mdview --line 120 CHANGELOG.md
 - `Ctrl-u`: half-page up
 - `PageDown`: full-page down
 - `PageUp`: full-page up
+- `Ctrl-f`: full-page down (Vim-style)
+- `Ctrl-b`: full-page up (Vim-style)
 - `g` / `Home`: jump to top
 - `G` / `End`: jump to bottom
 - `r`: reload file from disk
