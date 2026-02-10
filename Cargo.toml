@@ -1,6 +1,6 @@
 [package]
 name = "mdvi"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Professional markdown viewer for the terminal with Vim-style navigation"
 license = "MIT"
@@ -18,6 +18,7 @@ regex = "1.11"
 image = "0.25"
 ratatui-image = { version = "8.1", default-features = false, features = ["crossterm", "image-defaults"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
 unicode-width = "0.1"
 
 [profile.release]

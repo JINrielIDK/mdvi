@@ -1,11 +1,16 @@
 use anyhow::{Context, Result};
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
 };
 use regex::Regex;
 use std::sync::OnceLock;
+use syntect::{
+    easy::HighlightLines,
+    highlighting::{FontStyle, Style as SyntectStyle, Theme, ThemeSet},
+    parsing::SyntaxSet,
+};
 
 #[derive(Debug, Clone)]
 pub struct RenderedDoc {
@@ -25,6 +30,11 @@ enum ListKind {
     Unordered,
 }
 
+struct CodeHighlightAssets {
+    syntax_set: SyntaxSet,
+    theme: Theme,
+}
+
 pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
@@ -41,6 +51,7 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
     let mut style_stack = vec![Style::default()];
     let mut list_stack: Vec<ListKind> = Vec::new();
     let mut in_code_block = false;
+    let mut active_code_highlighter: Option<HighlightLines<'static>> = None;
     let mut in_blockquote = 0usize;
     let mut pending_link: Option<String> = None;
     let mut pending_image: Option<(String, String)> = None;
@@ -162,7 +173,7 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
                 Tag::CodeBlock(kind) => {
                     blank_line(&mut lines, &mut current_spans);
                     in_code_block = true;
-                    let code_block_lang = match kind {
+                    let code_block_info = match kind {
                         CodeBlockKind::Fenced(lang) => {
                             let lang = lang.trim();
                             if lang.is_empty() {
@@ -173,7 +184,13 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
                         }
                         CodeBlockKind::Indented => None,
                     };
-                    let header = match &code_block_lang {
+                    let code_block_language = code_block_info
+                        .as_deref()
+                        .and_then(extract_code_block_language_token)
+                        .map(ToString::to_string);
+                    active_code_highlighter = new_code_highlighter(code_block_language.as_deref());
+
+                    let header = match &code_block_info {
                         Some(lang) => format!("```{lang}"),
                         None => "```".to_string(),
                     };
@@ -271,6 +288,7 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
                     )));
                     lines.push(Line::default());
                     in_code_block = false;
+                    active_code_highlighter = None;
                 }
                 TagEnd::List(_) => {
                     list_stack.pop();
@@ -307,16 +325,13 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
             Event::Text(text) => {
                 let base = *style_stack.last().unwrap_or(&Style::default());
                 if in_code_block {
-                    let text = text.to_string();
-                    for line in text.split('\n') {
-                        if !line.is_empty() {
-                            current_spans.push(Span::styled(
-                                format!("  {line}"),
-                                base.add_modifier(Modifier::DIM),
-                            ));
-                        }
-                        push_line(&mut lines, &mut current_spans);
-                    }
+                    append_code_block_text(
+                        text.as_ref(),
+                        &mut current_spans,
+                        &mut lines,
+                        &mut active_code_highlighter,
+                        base,
+                    );
                 } else {
                     if current_spans.is_empty() && in_blockquote > 0 {
                         let prefix = format!("{}│ ", "  ".repeat(in_blockquote.saturating_sub(1)));
@@ -426,6 +441,122 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
     Ok(RenderedDoc { lines, images })
 }
 
+fn code_highlight_assets() -> &'static CodeHighlightAssets {
+    static ASSETS: OnceLock<CodeHighlightAssets> = OnceLock::new();
+
+    ASSETS.get_or_init(|| {
+        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let theme_set = ThemeSet::load_defaults();
+        let theme = theme_set
+            .themes
+            .get("base16-ocean.dark")
+            .or_else(|| theme_set.themes.values().next())
+            .cloned()
+            .expect("syntect bundled themes are available");
+
+        CodeHighlightAssets { syntax_set, theme }
+    })
+}
+
+fn extract_code_block_language_token(info: &str) -> Option<&str> {
+    let first = info.split_whitespace().next().unwrap_or_default().trim();
+    if first.is_empty() {
+        return None;
+    }
+    let token = first
+        .split([',', '{'])
+        .next()
+        .unwrap_or_default()
+        .trim_matches('.');
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
+fn lookup_syntax_for_language<'a>(
+    syntax_set: &'a SyntaxSet,
+    language: &str,
+) -> Option<&'a syntect::parsing::SyntaxReference> {
+    syntax_set
+        .find_syntax_by_token(language)
+        .or_else(|| syntax_set.find_syntax_by_extension(language))
+        .or_else(|| syntax_set.find_syntax_by_name(language))
+}
+
+fn new_code_highlighter(language: Option<&str>) -> Option<HighlightLines<'static>> {
+    let language = language?;
+    let assets = code_highlight_assets();
+    let syntax = lookup_syntax_for_language(&assets.syntax_set, language)?;
+    Some(HighlightLines::new(syntax, &assets.theme))
+}
+
+fn append_code_block_text(
+    text: &str,
+    current_spans: &mut Vec<Span<'static>>,
+    lines: &mut Vec<Line<'static>>,
+    active_code_highlighter: &mut Option<HighlightLines<'static>>,
+    base_style: Style,
+) {
+    let prefix_style = base_style.add_modifier(Modifier::DIM);
+    for line in text.split('\n') {
+        if !line.is_empty() {
+            current_spans.push(Span::styled("  ".to_string(), prefix_style));
+            let highlighted = active_code_highlighter
+                .as_mut()
+                .map(|highlighter| highlight_code_line(line, highlighter))
+                .unwrap_or_default();
+            if highlighted.is_empty() {
+                current_spans.push(Span::styled(line.to_string(), prefix_style));
+            } else {
+                current_spans.extend(highlighted);
+            }
+        }
+        push_line_or_blank(lines, current_spans);
+    }
+}
+
+fn highlight_code_line(
+    line: &str,
+    highlighter: &mut HighlightLines<'static>,
+) -> Vec<Span<'static>> {
+    let assets = code_highlight_assets();
+    match highlighter.highlight_line(line, &assets.syntax_set) {
+        Ok(highlighted) => highlighted
+            .into_iter()
+            .map(|(style, text)| Span::styled(text.to_string(), syntect_style_to_ratatui(style)))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn syntect_style_to_ratatui(style: SyntectStyle) -> Style {
+    let mut out = Style::default().fg(Color::Rgb(
+        style.foreground.r,
+        style.foreground.g,
+        style.foreground.b,
+    ));
+    if style.font_style.contains(FontStyle::BOLD) {
+        out = out.add_modifier(Modifier::BOLD);
+    }
+    if style.font_style.contains(FontStyle::ITALIC) {
+        out = out.add_modifier(Modifier::ITALIC);
+    }
+    if style.font_style.contains(FontStyle::UNDERLINE) {
+        out = out.add_modifier(Modifier::UNDERLINED);
+    }
+    out
+}
+
+fn push_line_or_blank(lines: &mut Vec<Line<'static>>, spans: &mut Vec<Span<'static>>) {
+    if spans.is_empty() {
+        lines.push(Line::default());
+    } else {
+        lines.push(Line::from(std::mem::take(spans)));
+    }
+}
+
 pub fn read_markdown_file(path: &std::path::Path) -> Result<String> {
     std::fs::read_to_string(path)
         .with_context(|| format!("failed to read file: {}", path.display()))
@@ -504,5 +635,46 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(caption_text.contains("Preview"));
+    }
+
+    #[test]
+    fn fenced_code_block_with_known_language_is_syntax_highlighted() {
+        let input = "```rust\nfn main() { println!(\"hi\"); }\n```";
+        let doc = render_markdown(input).expect("render succeeds");
+
+        let code_line = doc
+            .lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+                    .contains("fn main()")
+            })
+            .expect("code line should exist");
+
+        assert!(
+            code_line
+                .spans
+                .iter()
+                .any(|span| matches!(span.style.fg, Some(Color::Rgb(_, _, _)))),
+            "expected at least one syntax-colored span"
+        );
+    }
+
+    #[test]
+    fn fenced_code_block_with_unknown_language_falls_back_to_dim_text() {
+        let input = "```unknown-lang\nlet value = 42;\n```";
+        let doc = render_markdown(input).expect("render succeeds");
+
+        let code_span = doc
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref().contains("let value = 42;"))
+            .expect("fallback code span should exist");
+
+        assert!(code_span.style.add_modifier.contains(Modifier::DIM));
     }
 }
