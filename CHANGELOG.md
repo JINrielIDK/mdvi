@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-02-10
+
 ### Added
 - Vim-style full-page navigation with `Ctrl-f` (down) and `Ctrl-b` (up).
 - Visual highlighting for search matches in the document view, with stronger emphasis on the active match.

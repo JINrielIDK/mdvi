@@ -21,6 +21,13 @@ It renders markdown into a polished full-screen TUI with fast keyboard navigatio
 
 ## Install
 
+### Homebrew (tap)
+
+```bash
+brew tap taf2/tap
+brew install mdvi
+```
+
 ### From source
 
 ```bash
