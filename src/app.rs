@@ -56,6 +56,7 @@ struct App {
     active_match: usize,
     image_loader_tx: Sender<ImageLoadRequest>,
     image_loader_rx: Receiver<ImageLoadResult>,
+    virtual_row_count_cache: BTreeMap<u16, usize>,
 }
 
 struct InlineImage {
@@ -152,6 +153,7 @@ impl App {
             active_match: 0,
             image_loader_tx,
             image_loader_rx,
+            virtual_row_count_cache: BTreeMap::new(),
         })
     }
 
@@ -176,6 +178,7 @@ impl App {
                 if self.search_regex.is_some() {
                     self.rebuild_search_matches();
                 }
+                self.invalidate_virtual_row_cache();
                 self.status = if self.images.is_empty() {
                     format!("reloaded {}", self.file_path.display())
                 } else {
@@ -192,11 +195,21 @@ impl App {
         }
     }
 
-    fn total_virtual_lines(&self, content_width: u16) -> usize {
-        self.build_display_doc(content_width).lines.len().max(1)
+    fn invalidate_virtual_row_cache(&mut self) {
+        self.virtual_row_count_cache.clear();
     }
 
-    fn max_scroll(&self, viewport_height: usize, content_width: u16) -> usize {
+    fn total_virtual_lines(&mut self, content_width: u16) -> usize {
+        if let Some(cached_rows) = self.virtual_row_count_cache.get(&content_width).copied() {
+            return cached_rows;
+        }
+
+        let rows = self.build_display_doc(content_width).lines.len().max(1);
+        self.virtual_row_count_cache.insert(content_width, rows);
+        rows
+    }
+
+    fn max_scroll(&mut self, viewport_height: usize, content_width: u16) -> usize {
         self.total_virtual_lines(content_width)
             .saturating_sub(viewport_height.saturating_sub(1))
     }
@@ -237,6 +250,7 @@ impl App {
             self.search_regex = None;
             self.search_matches.clear();
             self.active_match = 0;
+            self.invalidate_virtual_row_cache();
             self.status = "search cleared".to_string();
             return;
         }
@@ -255,15 +269,16 @@ impl App {
         self.search_query = Some(query.to_string());
         self.search_regex = Some(regex);
         self.rebuild_search_matches();
+        self.invalidate_virtual_row_cache();
 
         if self.search_matches.is_empty() {
             self.status = format!("no matches for /{query}");
             return;
         }
 
-        self.scroll = self
-            .virtual_row_for_doc_line(self.search_matches[0], content_width)
-            .min(self.max_scroll(viewport_height, content_width));
+        let target_row = self.virtual_row_for_doc_line(self.search_matches[0], content_width);
+        let max_scroll = self.max_scroll(viewport_height, content_width);
+        self.scroll = target_row.min(max_scroll);
         self.status = format!("{} matches for /{query}", self.search_matches.len());
     }
 
@@ -273,9 +288,10 @@ impl App {
             return;
         }
         self.active_match = (self.active_match + 1) % self.search_matches.len();
-        self.scroll = self
-            .virtual_row_for_doc_line(self.search_matches[self.active_match], content_width)
-            .min(self.max_scroll(viewport_height, content_width));
+        let target_row =
+            self.virtual_row_for_doc_line(self.search_matches[self.active_match], content_width);
+        let max_scroll = self.max_scroll(viewport_height, content_width);
+        self.scroll = target_row.min(max_scroll);
     }
 
     fn jump_prev_match(&mut self, viewport_height: usize, content_width: u16) {
@@ -288,9 +304,10 @@ impl App {
         } else {
             self.active_match -= 1;
         }
-        self.scroll = self
-            .virtual_row_for_doc_line(self.search_matches[self.active_match], content_width)
-            .min(self.max_scroll(viewport_height, content_width));
+        let target_row =
+            self.virtual_row_for_doc_line(self.search_matches[self.active_match], content_width);
+        let max_scroll = self.max_scroll(viewport_height, content_width);
+        self.scroll = target_row.min(max_scroll);
     }
 
     fn active_match_line(&self) -> Option<usize> {
@@ -444,6 +461,9 @@ impl App {
 
             changed = true;
         }
+        if changed {
+            self.invalidate_virtual_row_cache();
+        }
         changed
     }
 
@@ -543,9 +563,8 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                 let display_doc = app.build_display_doc(content_width);
                 let total_rows = display_doc.lines.len().max(1);
                 let total_doc_lines = app.doc.lines.len().max(1);
-                app.scroll = app
-                    .scroll
-                    .min(app.max_scroll(viewport_height, content_width));
+                let max_scroll = app.max_scroll(viewport_height, content_width);
+                app.scroll = app.scroll.min(max_scroll);
                 app.request_images_near_viewport(&display_doc, viewport_height);
 
                 let cursor_virtual_row = if viewport_height == 0 {
@@ -990,6 +1009,7 @@ mod tests {
             active_match: 0,
             image_loader_tx,
             image_loader_rx,
+            virtual_row_count_cache: BTreeMap::new(),
         }
     }
 
@@ -997,7 +1017,63 @@ mod tests {
     fn scroll_clamps_to_bottom() {
         let mut app = test_app(100);
         app.scroll_down(1000, 20, 80);
-        assert_eq!(app.scroll, app.max_scroll(20, 80));
+        let max_scroll = app.max_scroll(20, 80);
+        assert_eq!(app.scroll, max_scroll);
+    }
+
+    #[test]
+    fn max_scroll_cache_is_keyed_by_content_width() {
+        let mut app = test_app(60);
+
+        let _ = app.max_scroll(20, 80);
+        let _ = app.max_scroll(20, 100);
+
+        assert_eq!(app.virtual_row_count_cache.get(&80).copied(), Some(60));
+        assert_eq!(app.virtual_row_count_cache.get(&100).copied(), Some(60));
+        assert_eq!(app.virtual_row_count_cache.len(), 2);
+    }
+
+    #[test]
+    fn max_scroll_cache_invalidates_when_search_changes() {
+        let mut app = test_app(20);
+        let _ = app.max_scroll(10, 80);
+        assert!(!app.virtual_row_count_cache.is_empty());
+
+        app.search("not present", 10, 80);
+        assert!(app.virtual_row_count_cache.is_empty());
+    }
+
+    #[test]
+    fn max_scroll_cache_invalidates_after_image_layout_update() {
+        let (image_loader_tx, _request_rx) = mpsc::channel::<ImageLoadRequest>();
+        let (result_tx, image_loader_rx) = mpsc::channel::<ImageLoadResult>();
+        let mut app = test_app(5);
+        app.images = vec![InlineImage {
+            line_index: 2,
+            source: Some(ResolvedImageSource::Remote(
+                "https://example.com/image.png".to_string(),
+            )),
+            state: None,
+            pixel_size: None,
+            hinted_pixel_size: None,
+            load_state: ImageLoadState::Loading,
+        }];
+        app.image_index_by_line = BTreeMap::from([(2usize, 0usize)]);
+        app.image_loader_tx = image_loader_tx;
+        app.image_loader_rx = image_loader_rx;
+
+        let _ = app.max_scroll(10, 80);
+        assert!(!app.virtual_row_count_cache.is_empty());
+
+        result_tx
+            .send(ImageLoadResult {
+                image_index: 0,
+                dynamic_image: Some(image::DynamicImage::new_rgb8(320, 200)),
+            })
+            .expect("image result should enqueue");
+
+        assert!(app.drain_image_results());
+        assert!(app.virtual_row_count_cache.is_empty());
     }
 
     #[test]

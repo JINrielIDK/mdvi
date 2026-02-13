@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-02-13
+
+### Changed
+- Cached virtual-row counts in `max_scroll` keyed by content width, with invalidation on reload, search-state changes, and image layout updates to avoid rebuilding the full display document on frequent navigation/redraw paths.
+
 ## [0.6.0] - 2026-02-11
 
 ### Added
