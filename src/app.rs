@@ -60,6 +60,7 @@ struct App {
     image_resize_tx: Sender<ImageResizeRequest>,
     image_resize_rx: Receiver<ImageResizeResult>,
     virtual_row_count_cache: BTreeMap<u16, usize>,
+    highlighted_lines_cache: Option<HighlightedLinesCache>,
 }
 
 struct InlineImage {
@@ -82,6 +83,12 @@ struct DisplayDoc {
     lines: Vec<Line<'static>>,
     image_plans: Vec<ImageRenderPlan>,
     doc_line_for_row: Vec<usize>,
+}
+
+struct HighlightedLinesCache {
+    query: Option<String>,
+    active_match_line: Option<usize>,
+    lines: Vec<Line<'static>>,
 }
 
 #[derive(Debug, Clone)]
@@ -185,6 +192,7 @@ impl App {
             image_resize_tx,
             image_resize_rx,
             virtual_row_count_cache: BTreeMap::new(),
+            highlighted_lines_cache: None,
         };
         app.request_local_dimension_probes();
         Ok(app)
@@ -211,6 +219,7 @@ impl App {
                     .enumerate()
                     .map(|(idx, image)| (image.line_index, idx))
                     .collect::<BTreeMap<usize, usize>>();
+                self.invalidate_highlight_cache();
                 self.request_local_dimension_probes();
                 if self.search_regex.is_some() {
                     self.rebuild_search_matches();
@@ -234,6 +243,10 @@ impl App {
 
     fn invalidate_virtual_row_cache(&mut self) {
         self.virtual_row_count_cache.clear();
+    }
+
+    fn invalidate_highlight_cache(&mut self) {
+        self.highlighted_lines_cache = None;
     }
 
     fn total_virtual_lines(&mut self, content_width: u16) -> usize {
@@ -287,6 +300,7 @@ impl App {
             self.search_regex = None;
             self.search_matches.clear();
             self.active_match = 0;
+            self.invalidate_highlight_cache();
             self.invalidate_virtual_row_cache();
             self.status = "search cleared".to_string();
             return;
@@ -306,6 +320,7 @@ impl App {
         self.search_query = Some(query.to_string());
         self.search_regex = Some(regex);
         self.rebuild_search_matches();
+        self.invalidate_highlight_cache();
         self.invalidate_virtual_row_cache();
 
         if self.search_matches.is_empty() {
@@ -325,6 +340,7 @@ impl App {
             return;
         }
         self.active_match = (self.active_match + 1) % self.search_matches.len();
+        self.invalidate_highlight_cache();
         let target_row =
             self.virtual_row_for_doc_line(self.search_matches[self.active_match], content_width);
         let max_scroll = self.max_scroll(viewport_height, content_width);
@@ -341,6 +357,7 @@ impl App {
         } else {
             self.active_match -= 1;
         }
+        self.invalidate_highlight_cache();
         let target_row =
             self.virtual_row_for_doc_line(self.search_matches[self.active_match], content_width);
         let max_scroll = self.max_scroll(viewport_height, content_width);
@@ -351,17 +368,35 @@ impl App {
         self.search_matches.get(self.active_match).copied()
     }
 
-    fn highlighted_lines(&self) -> Vec<Line<'static>> {
+    fn highlighted_lines(&mut self) -> Vec<Line<'static>> {
         let Some(regex) = self.search_regex.as_ref() else {
             return self.doc.lines.clone();
         };
+        let active_match_line = self.active_match_line();
+        let search_query = self.search_query.as_deref();
 
-        highlight_lines(&self.doc.lines, regex, self.active_match_line())
+        if let Some(cache) = self.highlighted_lines_cache.as_ref() {
+            if cache.query.as_deref() == search_query
+                && cache.active_match_line == active_match_line
+            {
+                return cache.lines.clone();
+            }
+        }
+
+        let lines = highlight_lines(&self.doc.lines, regex, active_match_line);
+        self.highlighted_lines_cache = Some(HighlightedLinesCache {
+            query: search_query.map(ToString::to_string),
+            active_match_line,
+            lines: lines.clone(),
+        });
+
+        lines
     }
 
     fn rebuild_search_matches(&mut self) {
         self.search_matches.clear();
         self.active_match = 0;
+        self.invalidate_highlight_cache();
 
         let Some(regex) = self.search_regex.as_ref() else {
             return;
@@ -610,7 +645,7 @@ impl App {
         changed
     }
 
-    fn build_display_doc(&self, content_width: u16) -> DisplayDoc {
+    fn build_display_doc(&mut self, content_width: u16) -> DisplayDoc {
         let source_lines = self.highlighted_lines();
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(source_lines.len());
         let mut image_plans = Vec::new();
@@ -1194,7 +1229,15 @@ mod tests {
             image_resize_tx,
             image_resize_rx,
             virtual_row_count_cache: BTreeMap::new(),
+            highlighted_lines_cache: None,
         }
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
     }
 
     #[test]
@@ -1473,6 +1516,45 @@ mod tests {
         app.jump_next_match(10, 80);
         assert_eq!(app.active_match, 0);
         assert_eq!(app.scroll, 3);
+    }
+
+    #[test]
+    fn highlighted_lines_cache_reuses_when_search_state_is_unchanged() {
+        let mut app = test_app(6);
+        app.doc.lines[2] = Line::from("alpha keyword");
+        app.search("keyword", 10, 80);
+
+        let _ = app.highlighted_lines();
+        assert!(app.highlighted_lines_cache.is_some());
+
+        app.doc.lines[2] = Line::from("mutated but cache should still be reused");
+        let highlighted = app.highlighted_lines();
+        assert_eq!(line_text(&highlighted[2]), "alpha keyword");
+    }
+
+    #[test]
+    fn highlighted_lines_cache_tracks_active_match_line() {
+        let mut app = test_app(20);
+        app.doc.lines[5] = Line::from("alpha keyword");
+        app.doc.lines[12] = Line::from("beta keyword");
+        app.search("keyword", 10, 80);
+
+        let _ = app.highlighted_lines();
+        assert_eq!(
+            app.highlighted_lines_cache
+                .as_ref()
+                .and_then(|cache| cache.active_match_line),
+            Some(5)
+        );
+
+        app.jump_next_match(10, 80);
+        let _ = app.highlighted_lines();
+        assert_eq!(
+            app.highlighted_lines_cache
+                .as_ref()
+                .and_then(|cache| cache.active_match_line),
+            Some(12)
+        );
     }
 
     #[test]

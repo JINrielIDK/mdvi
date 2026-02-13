@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-02-13
+
+### Changed
+- Cached search-highlighted lines so unchanged redraws reuse prior highlighted output instead of re-running regex highlighting across the whole document.
+
 ## [0.6.2] - 2026-02-13
 
 ### Changed
