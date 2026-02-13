@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-02-13
+
+### Changed
+- Moved local image dimension probing off the UI thread during load/reload by sending probe jobs to the background image worker.
+- Removed per-frame document line cloning before paragraph rendering by transferring ownership of display lines into `Text`.
+- Kept scrolling/input responsive while images load by throttling image-load result processing per UI tick.
+- Moved image resize/encode work off the UI thread into a dedicated background resize worker so rendering large images no longer blocks navigation.
+
 ## [0.6.1] - 2026-02-13
 
 ### Changed

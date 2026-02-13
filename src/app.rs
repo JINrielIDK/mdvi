@@ -25,7 +25,7 @@ use ratatui::{
 use ratatui_image::{
     picker::{Picker, ProtocolType},
     protocol::StatefulProtocol,
-    Resize, StatefulImage,
+    Resize, ResizeEncodeRender,
 };
 use regex::{Regex, RegexBuilder};
 use unicode_width::UnicodeWidthStr;
@@ -38,6 +38,7 @@ use crate::{
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 const DEFAULT_IMAGE_HINT_PIXEL_SIZE: (u32, u32) = (900, 500);
 const IMAGE_PRELOAD_VIEWPORTS: usize = 2;
+const MAX_IMAGE_RESULTS_PER_TICK: usize = 4;
 
 struct App {
     file_path: PathBuf,
@@ -56,6 +57,8 @@ struct App {
     active_match: usize,
     image_loader_tx: Sender<ImageLoadRequest>,
     image_loader_rx: Receiver<ImageLoadResult>,
+    image_resize_tx: Sender<ImageResizeRequest>,
+    image_resize_rx: Receiver<ImageResizeResult>,
     virtual_row_count_cache: BTreeMap<u16, usize>,
 }
 
@@ -63,6 +66,7 @@ struct InlineImage {
     line_index: usize,
     source: Option<ResolvedImageSource>,
     state: Option<StatefulProtocol>,
+    resize_pending: bool,
     pixel_size: Option<(u32, u32)>,
     hinted_pixel_size: Option<(u32, u32)>,
     load_state: ImageLoadState,
@@ -97,13 +101,37 @@ enum ImageLoadState {
 #[derive(Debug, Clone)]
 struct ImageLoadRequest {
     image_index: usize,
-    source: ResolvedImageSource,
+    job: ImageLoadJob,
 }
 
 #[derive(Debug)]
 struct ImageLoadResult {
     image_index: usize,
-    dynamic_image: Option<image::DynamicImage>,
+    payload: ImageLoadResultPayload,
+}
+
+#[derive(Debug, Clone)]
+enum ImageLoadJob {
+    ProbeLocalDimensions(PathBuf),
+    LoadImage(ResolvedImageSource),
+}
+
+#[derive(Debug)]
+enum ImageLoadResultPayload {
+    ProbedDimensions(Option<(u32, u32)>),
+    LoadedImage(Option<image::DynamicImage>),
+}
+
+struct ImageResizeRequest {
+    image_index: usize,
+    resize: Resize,
+    area: Rect,
+    protocol: StatefulProtocol,
+}
+
+struct ImageResizeResult {
+    image_index: usize,
+    protocol: StatefulProtocol,
 }
 
 #[derive(Debug, Default)]
@@ -116,6 +144,7 @@ enum Mode {
 impl App {
     fn new(file_path: PathBuf, start_line: usize, picker: Picker) -> Result<Self> {
         let (image_loader_tx, image_loader_rx) = start_image_loader_thread();
+        let (image_resize_tx, image_resize_rx) = start_image_resize_thread();
         let file_content = read_markdown_file(&file_path)?;
         let doc = render_markdown(&file_content)?;
         let images = prepare_images_for_doc(&file_path, &doc);
@@ -136,7 +165,7 @@ impl App {
             )
         };
 
-        Ok(Self {
+        let mut app = Self {
             file_path,
             file_content,
             doc,
@@ -153,8 +182,12 @@ impl App {
             active_match: 0,
             image_loader_tx,
             image_loader_rx,
+            image_resize_tx,
+            image_resize_rx,
             virtual_row_count_cache: BTreeMap::new(),
-        })
+        };
+        app.request_local_dimension_probes();
+        Ok(app)
     }
 
     fn reload(&mut self) {
@@ -164,17 +197,21 @@ impl App {
         }) {
             Ok((content, doc)) => {
                 let (image_loader_tx, image_loader_rx) = start_image_loader_thread();
+                let (image_resize_tx, image_resize_rx) = start_image_resize_thread();
                 self.file_content = content;
                 self.doc = doc;
                 self.images = prepare_images_for_doc(&self.file_path, &self.doc);
                 self.image_loader_tx = image_loader_tx;
                 self.image_loader_rx = image_loader_rx;
+                self.image_resize_tx = image_resize_tx;
+                self.image_resize_rx = image_resize_rx;
                 self.image_index_by_line = self
                     .images
                     .iter()
                     .enumerate()
                     .map(|(idx, image)| (image.line_index, idx))
                     .collect::<BTreeMap<usize, usize>>();
+                self.request_local_dimension_probes();
                 if self.search_regex.is_some() {
                     self.rebuild_search_matches();
                 }
@@ -409,6 +446,7 @@ impl App {
         }
 
         let Some(source) = image.source.clone() else {
+            image.resize_pending = false;
             image.load_state = ImageLoadState::Failed;
             return;
         };
@@ -417,13 +455,36 @@ impl App {
             .image_loader_tx
             .send(ImageLoadRequest {
                 image_index,
-                source,
+                job: ImageLoadJob::LoadImage(source),
             })
             .is_ok()
         {
+            image.resize_pending = false;
             image.load_state = ImageLoadState::Loading;
         } else {
+            image.resize_pending = false;
             image.load_state = ImageLoadState::Failed;
+        }
+    }
+
+    fn request_local_dimension_probes(&mut self) {
+        let mut probe_requests: Vec<(usize, PathBuf)> = Vec::new();
+
+        for (image_index, image) in self.images.iter().enumerate() {
+            if image.hinted_pixel_size.is_some() {
+                continue;
+            }
+            let Some(ResolvedImageSource::Local(path)) = image.source.as_ref() else {
+                continue;
+            };
+            probe_requests.push((image_index, path.clone()));
+        }
+
+        for (image_index, path) in probe_requests {
+            let _ = self.image_loader_tx.send(ImageLoadRequest {
+                image_index,
+                job: ImageLoadJob::ProbeLocalDimensions(path),
+            });
         }
     }
 
@@ -444,22 +505,104 @@ impl App {
         }
     }
 
-    fn drain_image_results(&mut self) -> bool {
+    fn request_image_resize(&mut self, image_index: usize, area: Rect) {
+        let Some(image) = self.images.get_mut(image_index) else {
+            return;
+        };
+        if image.resize_pending {
+            return;
+        }
+
+        let resize = Resize::Fit(None);
+        let Some(target_area) = image
+            .state
+            .as_ref()
+            .and_then(|state| state.needs_resize(&resize, area))
+        else {
+            return;
+        };
+
+        let Some(protocol) = image.state.take() else {
+            return;
+        };
+
+        match self.image_resize_tx.send(ImageResizeRequest {
+            image_index,
+            resize,
+            area: target_area,
+            protocol,
+        }) {
+            Ok(()) => {
+                image.resize_pending = true;
+            }
+            Err(err) => {
+                image.state = Some(err.0.protocol);
+                image.resize_pending = false;
+            }
+        }
+    }
+
+    fn drain_image_resize_results(&mut self) -> bool {
         let mut changed = false;
-        while let Ok(result) = self.image_loader_rx.try_recv() {
+        while let Ok(result) = self.image_resize_rx.try_recv() {
             let Some(image) = self.images.get_mut(result.image_index) else {
                 continue;
             };
-
-            if let Some(dynamic_image) = result.dynamic_image {
-                image.pixel_size = Some((dynamic_image.width(), dynamic_image.height()));
-                image.state = Some(self.picker.new_resize_protocol(dynamic_image));
-                image.load_state = ImageLoadState::Loaded;
-            } else {
-                image.load_state = ImageLoadState::Failed;
-            }
-
+            image.state = Some(result.protocol);
+            image.resize_pending = false;
             changed = true;
+        }
+        changed
+    }
+
+    fn image_placeholder(image: &InlineImage) -> &'static str {
+        if image.resize_pending {
+            return "[rendering image...]";
+        }
+
+        match image.load_state {
+            ImageLoadState::Loading => "[loading image...]",
+            ImageLoadState::Failed => "[image unavailable]",
+            ImageLoadState::NotRequested => "[image pending]",
+            ImageLoadState::Loaded => "[rendering image...]",
+        }
+    }
+
+    fn drain_image_results(&mut self) -> bool {
+        let mut changed = false;
+        let mut processed = 0usize;
+        while processed < MAX_IMAGE_RESULTS_PER_TICK {
+            let Ok(result) = self.image_loader_rx.try_recv() else {
+                break;
+            };
+            let Some(image) = self.images.get_mut(result.image_index) else {
+                processed += 1;
+                continue;
+            };
+
+            match result.payload {
+                ImageLoadResultPayload::LoadedImage(Some(dynamic_image)) => {
+                    image.pixel_size = Some((dynamic_image.width(), dynamic_image.height()));
+                    image.state = Some(self.picker.new_resize_protocol(dynamic_image));
+                    image.resize_pending = false;
+                    image.load_state = ImageLoadState::Loaded;
+                    changed = true;
+                }
+                ImageLoadResultPayload::LoadedImage(None) => {
+                    image.resize_pending = false;
+                    image.state = None;
+                    image.load_state = ImageLoadState::Failed;
+                    changed = true;
+                }
+                ImageLoadResultPayload::ProbedDimensions(Some(dimensions)) => {
+                    if image.pixel_size.is_none() && image.hinted_pixel_size.is_none() {
+                        image.hinted_pixel_size = Some(dimensions);
+                        changed = true;
+                    }
+                }
+                ImageLoadResultPayload::ProbedDimensions(None) => {}
+            }
+            processed += 1;
         }
         if changed {
             self.invalidate_virtual_row_cache();
@@ -544,6 +687,9 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
         if app.drain_image_results() {
             should_redraw = true;
         }
+        if app.drain_image_resize_results() {
+            should_redraw = true;
+        }
 
         if should_redraw {
             let terminal = tui.terminal_mut();
@@ -560,7 +706,7 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                 let content_inner = content_block.inner(chunks[0]);
                 let content_width = content_inner.width;
                 let viewport_height = usize::from(content_inner.height);
-                let display_doc = app.build_display_doc(content_width);
+                let mut display_doc = app.build_display_doc(content_width);
                 let total_rows = display_doc.lines.len().max(1);
                 let total_doc_lines = app.doc.lines.len().max(1);
                 let max_scroll = app.max_scroll(viewport_height, content_width);
@@ -586,7 +732,7 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                     .unwrap_or_else(|| app.doc.lines.len().saturating_sub(1));
                 let cursor_screen_row = cursor_virtual_row.saturating_sub(app.scroll);
 
-                let text = Text::from(display_doc.lines.clone());
+                let text = Text::from(std::mem::take(&mut display_doc.lines));
                 let paragraph = Paragraph::new(text)
                     .block(content_block)
                     .wrap(Wrap { trim: false })
@@ -628,21 +774,12 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                     // target heights while scrolling. That produces visible width distortion and
                     // choppy movement, so only draw loaded images when fully visible.
                     if is_fully_visible {
+                        app.request_image_resize(plan.image_index, image_area);
                         if let Some(image_state) = app.images[plan.image_index].state.as_mut() {
-                            frame.render_stateful_widget(
-                                StatefulImage::default().resize(Resize::Fit(None)),
-                                image_area,
-                                image_state,
-                            );
-                        }
-                    } else if app.images[plan.image_index].state.is_none() {
-                        let placeholder = match app.images[plan.image_index].load_state {
-                            ImageLoadState::Loading => "[loading image...]",
-                            ImageLoadState::Failed => "[image unavailable]",
-                            ImageLoadState::NotRequested => "[image pending]",
-                            ImageLoadState::Loaded => "",
-                        };
-                        if !placeholder.is_empty() {
+                            image_state.render(image_area, frame.buffer_mut());
+                        } else {
+                            let placeholder =
+                                App::image_placeholder(&app.images[plan.image_index]);
                             frame.render_widget(
                                 Paragraph::new(Line::from(Span::styled(
                                     format!("  {placeholder}"),
@@ -651,6 +788,15 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                                 image_area,
                             );
                         }
+                    } else if app.images[plan.image_index].state.is_none() {
+                        let placeholder = App::image_placeholder(&app.images[plan.image_index]);
+                        frame.render_widget(
+                            Paragraph::new(Line::from(Span::styled(
+                                format!("  {placeholder}"),
+                                Style::default().add_modifier(Modifier::DIM),
+                            ))),
+                            image_area,
+                        );
                     }
                 }
 
@@ -874,16 +1020,6 @@ fn prepare_images_for_doc(markdown_path: &Path, doc: &RenderedDoc) -> Vec<Inline
         .iter()
         .map(|image| {
             let source = resolve_image_source(markdown_path, &image.src);
-            let mut hinted_pixel_size = image.hinted_pixel_size;
-
-            if hinted_pixel_size.is_none() {
-                if let Some(ResolvedImageSource::Local(path)) = source.as_ref() {
-                    if let Ok(reader) = ImageReader::open(path) {
-                        hinted_pixel_size = reader.into_dimensions().ok();
-                    }
-                }
-            }
-
             let load_state = if source.is_some() {
                 ImageLoadState::NotRequested
             } else {
@@ -894,8 +1030,9 @@ fn prepare_images_for_doc(markdown_path: &Path, doc: &RenderedDoc) -> Vec<Inline
                 line_index: image.line_index,
                 source,
                 state: None,
+                resize_pending: false,
                 pixel_size: None,
-                hinted_pixel_size,
+                hinted_pixel_size: image.hinted_pixel_size,
                 load_state,
             }
         })
@@ -921,17 +1058,60 @@ fn image_loader_worker(request_rx: Receiver<ImageLoadRequest>, result_tx: Sender
         .ok();
 
     while let Ok(request) = request_rx.recv() {
-        let dynamic_image = load_dynamic_image(&request.source, remote_client.as_ref());
+        let payload = match request.job {
+            ImageLoadJob::ProbeLocalDimensions(path) => {
+                ImageLoadResultPayload::ProbedDimensions(probe_local_image_dimensions(&path))
+            }
+            ImageLoadJob::LoadImage(source) => ImageLoadResultPayload::LoadedImage(
+                load_dynamic_image(&source, remote_client.as_ref()),
+            ),
+        };
         if result_tx
             .send(ImageLoadResult {
                 image_index: request.image_index,
-                dynamic_image,
+                payload,
             })
             .is_err()
         {
             break;
         }
     }
+}
+
+fn start_image_resize_thread() -> (Sender<ImageResizeRequest>, Receiver<ImageResizeResult>) {
+    let (request_tx, request_rx) = mpsc::channel::<ImageResizeRequest>();
+    let (result_tx, result_rx) = mpsc::channel::<ImageResizeResult>();
+
+    let _ = thread::Builder::new()
+        .name("mdvi-image-resizer".to_string())
+        .spawn(move || image_resize_worker(request_rx, result_tx));
+
+    (request_tx, result_rx)
+}
+
+fn image_resize_worker(
+    request_rx: Receiver<ImageResizeRequest>,
+    result_tx: Sender<ImageResizeResult>,
+) {
+    while let Ok(mut request) = request_rx.recv() {
+        request
+            .protocol
+            .resize_encode(&request.resize, request.area);
+        if result_tx
+            .send(ImageResizeResult {
+                image_index: request.image_index,
+                protocol: request.protocol,
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+fn probe_local_image_dimensions(path: &Path) -> Option<(u32, u32)> {
+    let reader = ImageReader::open(path).ok()?;
+    reader.into_dimensions().ok()
 }
 
 fn load_dynamic_image(
@@ -984,6 +1164,8 @@ mod tests {
     fn test_app(lines: usize) -> App {
         let (image_loader_tx, _request_rx) = mpsc::channel::<ImageLoadRequest>();
         let (_result_tx, image_loader_rx) = mpsc::channel::<ImageLoadResult>();
+        let (image_resize_tx, _resize_request_rx) = mpsc::channel::<ImageResizeRequest>();
+        let (_resize_result_tx, image_resize_rx) = mpsc::channel::<ImageResizeResult>();
         let mut doc_lines = Vec::with_capacity(lines);
         for idx in 0..lines {
             doc_lines.push(Line::from(format!("Line {}", idx + 1)));
@@ -1009,6 +1191,8 @@ mod tests {
             active_match: 0,
             image_loader_tx,
             image_loader_rx,
+            image_resize_tx,
+            image_resize_rx,
             virtual_row_count_cache: BTreeMap::new(),
         }
     }
@@ -1054,6 +1238,7 @@ mod tests {
                 "https://example.com/image.png".to_string(),
             )),
             state: None,
+            resize_pending: false,
             pixel_size: None,
             hinted_pixel_size: None,
             load_state: ImageLoadState::Loading,
@@ -1068,12 +1253,196 @@ mod tests {
         result_tx
             .send(ImageLoadResult {
                 image_index: 0,
-                dynamic_image: Some(image::DynamicImage::new_rgb8(320, 200)),
+                payload: ImageLoadResultPayload::LoadedImage(Some(image::DynamicImage::new_rgb8(
+                    320, 200,
+                ))),
             })
             .expect("image result should enqueue");
 
         assert!(app.drain_image_results());
         assert!(app.virtual_row_count_cache.is_empty());
+    }
+
+    #[test]
+    fn local_dimension_probes_are_queued_for_unhinted_local_images() {
+        let (image_loader_tx, request_rx) = mpsc::channel::<ImageLoadRequest>();
+        let mut app = test_app(2);
+        app.images = vec![
+            InlineImage {
+                line_index: 0,
+                source: Some(ResolvedImageSource::Local(PathBuf::from(
+                    "/tmp/image-a.png",
+                ))),
+                state: None,
+                resize_pending: false,
+                pixel_size: None,
+                hinted_pixel_size: None,
+                load_state: ImageLoadState::NotRequested,
+            },
+            InlineImage {
+                line_index: 1,
+                source: Some(ResolvedImageSource::Remote(
+                    "https://example.com/image-b.png".to_string(),
+                )),
+                state: None,
+                resize_pending: false,
+                pixel_size: None,
+                hinted_pixel_size: None,
+                load_state: ImageLoadState::NotRequested,
+            },
+        ];
+        app.image_loader_tx = image_loader_tx;
+
+        app.request_local_dimension_probes();
+
+        let request = request_rx
+            .try_recv()
+            .expect("probe request should be queued");
+        assert_eq!(request.image_index, 0);
+        match request.job {
+            ImageLoadJob::ProbeLocalDimensions(path) => {
+                assert_eq!(path, PathBuf::from("/tmp/image-a.png"));
+            }
+            ImageLoadJob::LoadImage(_) => panic!("expected dimension probe request"),
+        }
+        assert!(request_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn probe_results_update_hints_and_invalidate_cache() {
+        let (image_loader_tx, _request_rx) = mpsc::channel::<ImageLoadRequest>();
+        let (result_tx, image_loader_rx) = mpsc::channel::<ImageLoadResult>();
+        let mut app = test_app(2);
+        app.images = vec![InlineImage {
+            line_index: 0,
+            source: Some(ResolvedImageSource::Local(PathBuf::from(
+                "/tmp/image-c.png",
+            ))),
+            state: None,
+            resize_pending: false,
+            pixel_size: None,
+            hinted_pixel_size: None,
+            load_state: ImageLoadState::NotRequested,
+        }];
+        app.image_loader_tx = image_loader_tx;
+        app.image_loader_rx = image_loader_rx;
+        app.virtual_row_count_cache.insert(80, 20);
+
+        result_tx
+            .send(ImageLoadResult {
+                image_index: 0,
+                payload: ImageLoadResultPayload::ProbedDimensions(Some((640, 360))),
+            })
+            .expect("probe result should enqueue");
+
+        assert!(app.drain_image_results());
+        assert_eq!(app.images[0].hinted_pixel_size, Some((640, 360)));
+        assert_eq!(app.images[0].load_state, ImageLoadState::NotRequested);
+        assert!(app.virtual_row_count_cache.is_empty());
+    }
+
+    #[test]
+    fn drain_image_results_limits_per_tick() {
+        let (image_loader_tx, _request_rx) = mpsc::channel::<ImageLoadRequest>();
+        let (result_tx, image_loader_rx) = mpsc::channel::<ImageLoadResult>();
+        let mut app = test_app(8);
+        app.images = (0..8)
+            .map(|line_index| InlineImage {
+                line_index,
+                source: Some(ResolvedImageSource::Remote(
+                    "https://example.com/image.png".to_string(),
+                )),
+                state: None,
+                resize_pending: false,
+                pixel_size: None,
+                hinted_pixel_size: None,
+                load_state: ImageLoadState::Loading,
+            })
+            .collect();
+        app.image_loader_tx = image_loader_tx;
+        app.image_loader_rx = image_loader_rx;
+
+        for image_index in 0..8 {
+            result_tx
+                .send(ImageLoadResult {
+                    image_index,
+                    payload: ImageLoadResultPayload::LoadedImage(Some(
+                        image::DynamicImage::new_rgb8(320, 200),
+                    )),
+                })
+                .expect("image result should enqueue");
+        }
+
+        assert!(app.drain_image_results());
+        let loaded_count = app
+            .images
+            .iter()
+            .filter(|image| image.load_state == ImageLoadState::Loaded)
+            .count();
+        assert_eq!(loaded_count, MAX_IMAGE_RESULTS_PER_TICK);
+    }
+
+    #[test]
+    fn request_image_resize_moves_work_off_ui_thread() {
+        let (image_resize_tx, resize_request_rx) = mpsc::channel::<ImageResizeRequest>();
+        let mut app = test_app(1);
+        app.images = vec![InlineImage {
+            line_index: 0,
+            source: Some(ResolvedImageSource::Remote(
+                "https://example.com/image.png".to_string(),
+            )),
+            state: Some(
+                app.picker
+                    .new_resize_protocol(image::DynamicImage::new_rgb8(320, 200)),
+            ),
+            resize_pending: false,
+            pixel_size: Some((320, 200)),
+            hinted_pixel_size: None,
+            load_state: ImageLoadState::Loaded,
+        }];
+        app.image_resize_tx = image_resize_tx;
+
+        app.request_image_resize(0, Rect::new(0, 0, 40, 10));
+
+        assert!(app.images[0].resize_pending);
+        assert!(app.images[0].state.is_none());
+        let request = resize_request_rx
+            .try_recv()
+            .expect("resize request should be queued");
+        assert_eq!(request.image_index, 0);
+    }
+
+    #[test]
+    fn resize_results_restore_render_state() {
+        let (image_resize_tx, _resize_request_rx) = mpsc::channel::<ImageResizeRequest>();
+        let (resize_result_tx, image_resize_rx) = mpsc::channel::<ImageResizeResult>();
+        let mut app = test_app(1);
+        app.images = vec![InlineImage {
+            line_index: 0,
+            source: Some(ResolvedImageSource::Remote(
+                "https://example.com/image.png".to_string(),
+            )),
+            state: None,
+            resize_pending: true,
+            pixel_size: Some((320, 200)),
+            hinted_pixel_size: None,
+            load_state: ImageLoadState::Loaded,
+        }];
+        app.image_resize_tx = image_resize_tx;
+        app.image_resize_rx = image_resize_rx;
+
+        resize_result_tx
+            .send(ImageResizeResult {
+                image_index: 0,
+                protocol: app
+                    .picker
+                    .new_resize_protocol(image::DynamicImage::new_rgb8(320, 200)),
+            })
+            .expect("resize result should enqueue");
+
+        assert!(app.drain_image_resize_results());
+        assert!(!app.images[0].resize_pending);
+        assert!(app.images[0].state.is_some());
     }
 
     #[test]
@@ -1244,6 +1613,7 @@ mod tests {
                 "https://example.com/image.png".to_string(),
             )),
             state: None,
+            resize_pending: false,
             pixel_size: None,
             hinted_pixel_size: Some((1708, 1040)),
             load_state: ImageLoadState::NotRequested,
@@ -1261,6 +1631,7 @@ mod tests {
                 "https://example.com/image.png".to_string(),
             )),
             state: None,
+            resize_pending: false,
             pixel_size: None,
             hinted_pixel_size: None,
             load_state: ImageLoadState::Failed,
